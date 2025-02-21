@@ -479,6 +479,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hostname",
+ "indexmap 2.7.1",
  "ipconfig",
  "mdns-sd",
  "nanoid",

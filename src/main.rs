@@ -16,6 +16,7 @@ mod agent;
 mod link_state;
 mod link_state_table;
 mod link_recovery_scheduler;
+mod handler;
 
 #[tokio::main]
 async fn main() {

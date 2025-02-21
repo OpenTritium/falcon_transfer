@@ -30,11 +30,12 @@ impl<'a> Msg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Handshake {
     Hello(Vec<u8>),
-    Exchage(Vec<u8>),
-    Finished(Vec<u8>),
+    Exchange(Vec<u8>),
+    Full(Vec<u8>),
 }
 
 // 除了发现报文需要源地址与目标地址外，其他报文只需要uid就可以查表到可达链路
+#[derive(Debug)]
 pub enum Event {
     Discovery {
         remote: EndPoint,

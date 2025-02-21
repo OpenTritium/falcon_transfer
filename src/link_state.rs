@@ -1,8 +1,10 @@
 use crate::{endpoint::EndPoint, link_recovery_scheduler::RecoveryTask};
+use bitflags::bitflags;
+use std::hash::Hash;
 use std::{
     sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,11 +14,19 @@ use tracing::{error, info};
 #[derive(Debug, Error)]
 pub enum LinkError {
     #[error("No healthy links available")]
-    NoHealthyLinks,
-    #[error("Link failure: {0}")]
-    Failure(String),
+    LinksNotFound,
+    #[error("没有到目标主机的可达路径")]
+    BondNotFound,
 }
-
+bitflags! {
+    pub struct LinkStateFlag:u8 {
+        const DISCOVED = 0;//与其他标识同时存在
+        const HELLO = 1;
+        const EXCHANGE = Self::HELLO.bits() << 1;
+        const FULL = Self::EXCHANGE.bits() << 1;
+        const TRANSFER = 0b11;// 与其他标识存在
+    }
+}
 #[derive(Debug)]
 pub struct LinkState {
     pub addr_local: EndPoint,
@@ -26,6 +36,31 @@ pub struct LinkState {
     pub is_healthy: AtomicBool,
     pub last_used: AtomicU64,
 }
+
+impl Hash for LinkState {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr_local.hash(state);
+        self.addr_remote.hash(state);
+        self.metric.hash(state);
+        self.failure_count.load(Ordering::SeqCst).hash(state);
+        self.is_healthy.load(Ordering::SeqCst).hash(state);
+        self.last_used.load(Ordering::SeqCst).hash(state);
+    }
+}
+
+impl PartialEq for LinkState {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr_local == other.addr_local
+            && self.addr_remote == other.addr_remote
+            && self.metric == other.metric
+            && self.failure_count.load(Ordering::SeqCst)
+                == other.failure_count.load(Ordering::SeqCst)
+            && self.is_healthy.load(Ordering::SeqCst) == other.is_healthy.load(Ordering::SeqCst)
+            && self.last_used.load(Ordering::SeqCst) == other.last_used.load(Ordering::SeqCst)
+    }
+}
+
+impl Eq for LinkState {}
 
 impl LinkState {
     pub fn new(addr_local: EndPoint, addr_remote: EndPoint, metric: u64) -> Self {
@@ -38,7 +73,6 @@ impl LinkState {
             last_used: AtomicU64::new(0),
         }
     }
-
     pub fn reset(&self) {
         self.failure_count.store(0, Ordering::SeqCst);
         self.is_healthy.store(true, Ordering::SeqCst);
@@ -66,6 +100,7 @@ pub trait Fade {
 
 impl Fade for LinkState {
     // 链路状态表负责调用此函数，返回some代表还有推迟的必要
+    // 一旦调用此函数，就暂时不会被assigned到不健康的链路
     fn delay(self: Arc<Self>) -> Option<RecoveryTask> {
         // 记录错误次数，将链路标记为不健康
         let failure_count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -77,6 +112,14 @@ impl Fade for LinkState {
             3 => Duration::from_mins(1).into(),
             _ => return None, // 当链路状态返回无的时候，链路状态表drop它
         };
-        Some(RecoveryTask::new(delay, Box::new(move || self.reset())))
+        let link = Arc::downgrade(&self);
+        Some(RecoveryTask::new(
+            delay,
+            Box::new(move || {
+                if let Some(link) = link.upgrade() {
+                    link.reset();
+                }
+            }),
+        ))
     }
 }
