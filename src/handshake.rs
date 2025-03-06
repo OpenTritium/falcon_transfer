@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use snow::StatelessTransportState;
 use snow::Builder;
+use snow::StatelessTransportState;
 
 static SECRET: &[u8; 32] = b"i don't care for fidget spinners";
 pub fn handshake() -> Result<()> {
@@ -38,14 +38,13 @@ pub fn handshake() -> Result<()> {
     Ok(())
 }
 
-    // double handshake
-    // 事件枚举
-    // 主动握手被动握手
- 
+// double handshake
+// 事件枚举
+// 主动握手被动握手
+
 // 注入事件
 // 注入消息发送器
-fn ActiveAuth()->Result<StatelessTransportState>{
-    
+fn ActiveAuth() -> Result<StatelessTransportState> {
     const PATTERN: &str = "Noise_XX_25519_AESGCM_BLAKE2b";
     let builder = Builder::new(PATTERN.parse()?);
     let local_key = builder.generate_keypair()?;

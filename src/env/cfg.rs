@@ -1,6 +1,5 @@
+use crate::utils::Uid;
 use std::sync::OnceLock;
-
-use crate::uid::Uid;
 
 pub struct Env {
     pub host_id: Uid,
@@ -12,7 +11,7 @@ pub struct Env {
 
 static ENV: OnceLock<Env> = OnceLock::new();
 
-pub fn env() -> &'static Env {
+pub fn global_config() -> &'static Env {
     ENV.get_or_init(|| Env {
         host_id: Uid::new(),
         host_name: &(|| hostname::get().unwrap().to_string_lossy().to_string()),

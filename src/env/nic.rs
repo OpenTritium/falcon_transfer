@@ -1,4 +1,4 @@
-use crate::scoped_addr::ScopedAddr;
+use crate::utils::ScopedAddr;
 use netif::{Interface, Up};
 use std::net::IpAddr;
 

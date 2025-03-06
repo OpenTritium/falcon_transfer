@@ -1,9 +1,12 @@
-use std::{fmt::Display, net::{SocketAddr, SocketAddrV6}};
-
-use crate::scoped_addr::{ScopeId, ScopedAddr};
-use ScopedAddr::*;
+use crate::utils::scoped_addr::{ScopeId, ScopedAddr};
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
+use std::{
+    fmt::Display,
+    net::{SocketAddr, SocketAddrV6},
+};
+use ScopedAddr::*;
+
 type Port = u16;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Hash, Eq)]

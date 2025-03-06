@@ -6,8 +6,8 @@ use thiserror::Error;
 use tokio::{
     spawn,
     sync::{
+        mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender},
         Semaphore,
-        mpsc::{UnboundedReceiver, UnboundedSender, error::SendError, unbounded_channel},
     },
     task::AbortHandle,
 };
@@ -15,7 +15,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     endpoint::EndPoint,
-    link_state_table::LinkStateTable,
+    link::LinkStateTable,
     msg::{Event, Msg},
     socket::{MsgSink, MsgSinkStreamGroup, MsgStream},
 };
@@ -42,7 +42,7 @@ struct Agent {
 pub type MsgReceiver = UnboundedReceiver<Msg>;
 pub type MsgSender = UnboundedSender<Msg>;
 pub type EventReceiver = UnboundedReceiver<Event>;
-pub type EventSender =  UnboundedSender<Event>;
+pub type EventSender = UnboundedSender<Event>;
 
 impl Agent {
     // 注入链路表，因为事件处理器也会分享
@@ -103,7 +103,7 @@ impl Agent {
                     error!("[{}] 处理失败: {}", ep, err);
                 });
         })
-        .abort_handle()
+            .abort_handle()
     }
 
     fn run_send(
@@ -158,7 +158,7 @@ impl Agent {
                 })
                 .await;
         })
-        .abort_handle()
+            .abort_handle()
     }
 }
 

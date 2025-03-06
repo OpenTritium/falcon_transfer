@@ -1,4 +1,4 @@
-use crate::{endpoint::EndPoint, uid::Uid};
+use crate::utils::{EndPoint, Uid};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ pub enum Event {
 }
 
 impl From<(Msg, EndPoint)> for Event {
-    //  第二个地址实际上是本地传入地址，仅仅在通过发现报文构建链路状态表时才需要
+    //  第二个地址实际上是本地传入的接口地址，仅仅在通过发现报文构建链路状态表时才需要
     fn from(parcel: (Msg, EndPoint)) -> Self {
         use Msg::*;
         match parcel {

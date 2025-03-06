@@ -1,9 +1,8 @@
+use crate::env::global_config;
+use crate::utils::Msg;
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::warn;
-use crate::env;
-use crate::msg::Msg;
-
 
 #[derive(Default)]
 pub struct MsgCodec;
@@ -23,7 +22,7 @@ impl Encoder<Msg> for MsgCodec {
                 .to_be_bytes()
                 .iter()
                 .copied()
-                .chain([env().protocol_version].iter().copied())
+                .chain([global_config().protocol_version].iter().copied())
                 .chain(msg),
         );
         Ok(())
@@ -52,7 +51,7 @@ impl Decoder for MsgCodec {
             src.reserve(msg_len - src.len());
             return Ok(None);
         }
-        if protocol_version != env().protocol_version {
+        if protocol_version != global_config().protocol_version {
             // 协议版本不对，忽略此条消息
             src.advance(msg_len);
             return Ok(None);

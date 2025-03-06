@@ -1,8 +1,8 @@
-use AddrConvertError::*;
-use ScopedAddr::*;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, net::Ipv6Addr};
 use thiserror::Error;
+use AddrConvertError::*;
+use ScopedAddr::*;
 
 #[derive(Debug, Error)]
 pub enum AddrConvertError {
@@ -48,7 +48,7 @@ impl TryFrom<(Ipv6Addr, ScopeId)> for ScopedAddr {
         if addr.is_unicast_link_local() {
             return Ok(Lan { addr, scope });
         }
-        return Err(NotLinkLocal);
+        Err(NotLinkLocal)
     }
 }
 
@@ -59,7 +59,7 @@ impl TryFrom<Ipv6Addr> for ScopedAddr {
         if addr.is_unicast_global() {
             return Ok(Wan(addr));
         }
-        return Err(NotGlobal);
+        Err(NotGlobal)
     }
 }
 

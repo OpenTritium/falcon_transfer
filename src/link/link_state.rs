@@ -1,4 +1,5 @@
-use crate::{endpoint::EndPoint, link_recovery_scheduler::RecoveryTask};
+use crate::link::ResumeTask;
+use crate::utils::EndPoint;
 use bitflags::bitflags;
 use std::hash::Hash;
 use std::{
@@ -54,7 +55,7 @@ impl PartialEq for LinkState {
             && self.addr_remote == other.addr_remote
             && self.metric == other.metric
             && self.failure_count.load(Ordering::SeqCst)
-                == other.failure_count.load(Ordering::SeqCst)
+            == other.failure_count.load(Ordering::SeqCst)
             && self.is_healthy.load(Ordering::SeqCst) == other.is_healthy.load(Ordering::SeqCst)
             && self.last_used.load(Ordering::SeqCst) == other.last_used.load(Ordering::SeqCst)
     }
@@ -95,25 +96,25 @@ impl LinkState {
 }
 
 pub trait Fade {
-    fn delay(self: Arc<Self>) -> Option<RecoveryTask>;
+    fn delay(self: Arc<Self>) -> Option<ResumeTask>;
 }
 
 impl Fade for LinkState {
     // 链路状态表负责调用此函数，返回some代表还有推迟的必要
     // 一旦调用此函数，就暂时不会被assigned到不健康的链路
-    fn delay(self: Arc<Self>) -> Option<RecoveryTask> {
+    fn delay(self: Arc<Self>) -> Option<ResumeTask> {
         // 记录错误次数，将链路标记为不健康
         let failure_count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
         self.is_healthy.store(false, Ordering::SeqCst);
         let delay = match failure_count {
             0 => unreachable!(), //调用此函数说明至少错了一次
-            1 => Duration::from_secs(5).into(),
-            2 => Duration::from_secs(30).into(),
-            3 => Duration::from_mins(1).into(),
+            1 => Duration::from_secs(5),
+            2 => Duration::from_secs(30),
+            3 => Duration::from_mins(1),
             _ => return None, // 当链路状态返回无的时候，链路状态表drop它
         };
         let link = Arc::downgrade(&self);
-        Some(RecoveryTask::new(
+        Some(ResumeTask::new(
             delay,
             Box::new(move || {
                 if let Some(link) = link.upgrade() {
