@@ -1,20 +1,25 @@
 use crate::utils::{EndPoint, Uid};
 use serde::{Deserialize, Serialize};
 
+use super::HandshakeState;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Msg {
+    /// 发明报文用于构建链路状态表，这里包含的是对方的uid和地址
     Discovery {
         host_id: Uid,
-        addr: EndPoint,
+        remote: EndPoint,
     },
     Auth {
         host_id: Uid,
-        state: Handshake,
+        state: HandshakeState,
     },
+    /// 当 seq 为 0 时，表示的是文件的基本信息
+    /// 随后才是文件内容
     Transfer {
         host_id: Uid,
         task_id: Uid,
-        seq: u64, //seq为0时，包含的是文件基本信息
+        seq: u64,
     },
 }
 
@@ -27,55 +32,4 @@ impl<'a> Msg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Handshake {
-    Hello(Vec<u8>),
-    Exchange(Vec<u8>),
-    Full(Vec<u8>),
-}
 
-// 除了发现报文需要源地址与目标地址外，其他报文只需要uid就可以查表到可达链路
-#[derive(Debug)]
-pub enum Event {
-    Discovery {
-        remote: EndPoint,
-        host_id: Uid,
-        local: EndPoint,
-    },
-    Auth {
-        host_id: Uid,
-        state: Handshake,
-    },
-    Transfer {
-        host_id: Uid,
-        task_id: Uid,
-        seq: u64,
-    },
-}
-
-impl From<(Msg, EndPoint)> for Event {
-    //  第二个地址实际上是本地传入的接口地址，仅仅在通过发现报文构建链路状态表时才需要
-    fn from(parcel: (Msg, EndPoint)) -> Self {
-        use Msg::*;
-        match parcel {
-            (Discovery { host_id, addr: src }, dest) => Event::Discovery {
-                remote: src,
-                host_id,
-                local: dest,
-            },
-            (Auth { host_id, state }, _) => Event::Auth { host_id, state },
-            (
-                Transfer {
-                    host_id,
-                    task_id,
-                    seq,
-                },
-                _,
-            ) => Event::Transfer {
-                host_id,
-                task_id,
-                seq,
-            },
-        }
-    }
-}

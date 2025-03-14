@@ -85,29 +85,28 @@ mod tests {
 
     #[test]
     fn link_local_addr()->Result<(), AddrConvertError> {
-        let addr = "fe80::80a4:abff:85bd:69b2".parse::<Ipv6Addr>()?;
+        let addr = "fe80::80a4:abff:85bd:69b2".parse::<Ipv6Addr>().unwrap();
         let scope = 0;
         let lan = ScopedAddr::try_from((addr, scope))?;
         assert_eq!(lan, ScopedAddr::Lan { addr, scope });
         assert_eq!(lan.is_lan(), true);
+        Ok(())
     }
 
     #[test]
     fn global_addr()->Result<(),AddrConvertError> {
-        let addr = "240e:430:123b:79d8:cf61:9682:3589:64e6".parse::<Ipv6Addr>()?;
+        let addr = "240e:430:123b:79d8:cf61:9682:3589:64e6".parse::<Ipv6Addr>().unwrap();
         let wan = ScopedAddr::try_from(addr)?;
         assert_eq!(wan, ScopedAddr::Wan(addr));
         assert_eq!(wan.is_wan(), true);
+        Ok(())
     }
 
     #[test]
     #[should_panic]
-    fn multicast_addr()->Result<(),AddrConvertError> {
-        let addr = "ff02::1".parse::<Ipv6Addr>()?;
+    fn multicast_addr() {
+        let addr = "ff02::1".parse::<Ipv6Addr>().unwrap();
         let scope = 1;
-        let lan = ScopedAddr::try_from((addr, scope))?;
-        assert_eq!(lan, ScopedAddr::Lan { addr, scope });
-        assert_eq!(lan.is_lan(), false);
-        assert_eq!(lan.is_wan(), false);
+        ScopedAddr::try_from((addr, scope)).unwrap();
     }
 }
