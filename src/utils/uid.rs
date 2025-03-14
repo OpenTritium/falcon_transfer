@@ -1,14 +1,14 @@
+use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     ops::{Deref, Not},
     str::FromStr,
 };
-use nanoid::nanoid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UidError {
-    #[error("Invalid Uid{0}")]
+    #[error("Invalid Uid: {0}")]
     Invalid(String),
 }
 
@@ -17,7 +17,7 @@ pub struct Uid(String);
 
 impl Uid {
     const ID_LEN: usize = 32;
-    pub fn new() -> Self {
+    pub fn random() -> Self {
         #[allow(unused_braces)]
         Self(nanoid!({ Self::ID_LEN }))
     }
@@ -52,25 +52,26 @@ impl Display for Uid {
 mod tests {
     use super::*;
     #[test]
-    fn test_new() {
-        let uid = Uid::new();
+    fn generate() {
+        let uid = Uid::random();
         assert_eq!(uid.len(), Uid::ID_LEN);
     }
 
     #[test]
     fn valid() {
-        let uid = Uid::from_str(Uid::new().as_str());
+        let uid = Uid::from_str(Uid::random().as_str());
         assert!(uid.is_ok());
     }
 
     #[test]
     #[should_panic]
-    fn short_string() {
+    fn short_str_into_uid() {
         Uid::from_str("r3u98hh3w").unwrap();
     }
+
     #[test]
     #[should_panic]
-    fn invalid_char() {
+    fn str_with_invalid_char_into_uid() {
         Uid::from_str(" ").unwrap();
     }
 }

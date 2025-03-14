@@ -1,10 +1,20 @@
 use super::ResumeTask;
 use futures::StreamExt;
+use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::{
-    sync::mpsc::{channel, Sender},
+    sync::mpsc::{Sender, channel},
     task::AbortHandle,
 };
 use tokio_util::time::DelayQueue;
+
+#[derive(Debug, Error)]
+pub enum ResumeTaskError {
+    #[error("the link_state entry has been removed bt another thread.")]
+    RemovedByOtherThread,
+    #[error(transparent)]
+    TaskSendError(#[from] TrySendError<ResumeTask>),
+}
 
 pub struct ResumeScheduler {
     abort: AbortHandle,
@@ -12,13 +22,13 @@ pub struct ResumeScheduler {
 
 impl ResumeScheduler {
     pub fn run() -> (Self, Sender<ResumeTask>) {
-        let (tx, mut rx) = channel::<ResumeTask>(128); // todo 认真考虑背压    
+        let (tx, mut rx) = channel::<ResumeTask>(128); // todo 认真考虑背压
         let abort = tokio::spawn(async move {
             let mut delay_queue = DelayQueue::new();
             loop {
                 tokio::select! {
                     Some(task) = rx.recv() => {
-                        delay_queue.insert(task.callback, task.delay);
+                        delay_queue.insert(task.callback, task.timeout);
                     }
                     Some(expired) = delay_queue.next() => {
                         let callback = expired.into_inner();
@@ -27,7 +37,7 @@ impl ResumeScheduler {
                 }
             }
         })
-            .abort_handle();
+        .abort_handle();
         (Self { abort }, tx)
     }
 }

@@ -2,13 +2,13 @@ use crate::link::assigned::AssignedLink;
 use crate::link::bond::Bond;
 use crate::link::{ResumeScheduler, ResumeTask};
 use crate::{
-    link::link_state::{Fade, LinkError, LinkState},
+    link::link_state::{LinkError, LinkState},
     utils::EndPoint,
     utils::Uid,
 };
 use dashmap::DashMap;
 use rand::Rng;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::mpsc::Sender;
 
 pub struct LinkStateTable {
@@ -31,7 +31,7 @@ impl LinkStateTable {
         self.links
             .entry(uid)
             .and_modify(|bond| {
-                bond.add_link(local, remote);
+                bond.update(local, remote);
             })
             .or_insert_with(|| Bond::new(local, remote));
     }
@@ -86,12 +86,12 @@ impl LinkStateTable {
         let solve = {
             let uid = uid.clone();
             let links = self.links.clone();
-            let sender = self.delay_task_sender.clone();
+            let delay_task_sender = self.delay_task_sender.clone();
             //  最重要的引用保存在表中，这里也会持有一份，此函数调用之后返回的结果不包含强引用
             // 很显然它可能会被很多线程同时调用，因为可能会派发相同的链路
             Box::new(move || {
-                if let Some(task) = Fade::delay(selected_link.clone()) {
-                    sender.try_send(task)?;
+                if let Some(task) = selected_link.clone().delay() {
+                    delay_task_sender.try_send(task)?;
                     Ok(())
                 }
                 // 返回none代表没必要延迟了

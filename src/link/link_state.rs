@@ -4,8 +4,8 @@ use bitflags::bitflags;
 use std::hash::Hash;
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,7 @@ use tracing::{error, info};
 pub enum LinkError {
     #[error("No healthy links available")]
     LinksNotFound,
-    #[error("没有到目标主机的可达路径")]
+    #[error("no way to reach this bond")]
     BondNotFound,
 }
 bitflags! {
@@ -44,9 +44,9 @@ impl Hash for LinkState {
         self.addr_local.hash(state);
         self.addr_remote.hash(state);
         self.metric.hash(state);
-        self.failure_count.load(Ordering::SeqCst).hash(state);
-        self.is_healthy.load(Ordering::SeqCst).hash(state);
-        self.last_used.load(Ordering::SeqCst).hash(state);
+        self.failure_count.load(Ordering::Acquire).hash(state);
+        self.is_healthy.load(Ordering::Acquire).hash(state);
+        self.last_used.load(Ordering::Relaxed).hash(state);
     }
 }
 
@@ -55,10 +55,10 @@ impl PartialEq for LinkState {
         self.addr_local == other.addr_local
             && self.addr_remote == other.addr_remote
             && self.metric == other.metric
-            && self.failure_count.load(Ordering::SeqCst)
-            == other.failure_count.load(Ordering::SeqCst)
-            && self.is_healthy.load(Ordering::SeqCst) == other.is_healthy.load(Ordering::SeqCst)
-            && self.last_used.load(Ordering::SeqCst) == other.last_used.load(Ordering::SeqCst)
+            && self.failure_count.load(Ordering::Acquire)
+                == other.failure_count.load(Ordering::Acquire)
+            && self.is_healthy.load(Ordering::Acquire) == other.is_healthy.load(Ordering::Acquire)
+            && self.last_used.load(Ordering::Relaxed) == other.last_used.load(Ordering::Relaxed)
     }
 }
 
@@ -75,17 +75,20 @@ impl LinkState {
             last_used: AtomicU64::new(0),
         }
     }
+
     pub fn reset(&self) {
-        self.failure_count.store(0, Ordering::SeqCst);
-        self.is_healthy.store(true, Ordering::SeqCst);
+        self.failure_count.store(0, Ordering::Release);
+        self.is_healthy.store(true, Ordering::Release);
         info!("Link {}->{} recovered", self.addr_local, self.addr_remote);
     }
+
     // 应当对不同系统有不一样的行为
     pub fn weight(&self) -> u64 {
         // Use inverse metric + 1 to avoid division by zero
         // Higher metric means lower weight
         1_000_000 / (self.metric + 1)
     }
+
     // 分配链路后立刻调用
     pub fn update_usage(&self) {
         let now = SystemTime::now()
@@ -94,19 +97,12 @@ impl LinkState {
             .as_secs();
         self.last_used.store(now, Ordering::Relaxed);
     }
-}
 
-pub trait Fade {
-    fn delay(self: Arc<Self>) -> Option<ResumeTask>;
-}
-
-impl Fade for LinkState {
-    // 链路状态表负责调用此函数，返回some代表还有推迟的必要
-    // 一旦调用此函数，就暂时不会被assigned到不健康的链路
-    fn delay(self: Arc<Self>) -> Option<ResumeTask> {
+    pub fn delay(self: Arc<Self>) -> Option<ResumeTask> {
         // 记录错误次数，将链路标记为不健康
-        let failure_count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
-        self.is_healthy.store(false, Ordering::SeqCst);
+        // relaxed 足矣，马上有release同步
+        let failure_count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.is_healthy.store(false, Ordering::Release);
         let delay = match failure_count {
             0 => unreachable!(), //调用此函数说明至少错了一次
             1 => Duration::from_secs(5),

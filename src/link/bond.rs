@@ -1,6 +1,6 @@
 use crate::link::{LinkState, LinkStateFlag};
 use crate::utils::EndPoint;
-use indexmap::{indexset, IndexSet};
+use indexmap::{IndexSet, indexset};
 use std::sync::Arc;
 
 pub struct Bond {
@@ -16,13 +16,14 @@ impl Bond {
         }
     }
     // 仅当不存在时才构造link_state
-    pub fn add_link(&mut self, local: EndPoint, remote: EndPoint) {
+    pub fn update(&mut self, local: EndPoint, remote: EndPoint) {
         // 先检查是否存在相同 local/remote 的 LinkState
         if self
             .links
             .iter()
             .any(|link| link.addr_local == local && link.addr_remote == remote)
         {
+            // todo query metric
             self.links
                 .insert(Arc::new(LinkState::new(local, remote, 0)));
         }
