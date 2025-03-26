@@ -90,7 +90,7 @@ impl LinkStateTable {
             //  最重要的引用保存在表中，这里也会持有一份，此函数调用之后返回的结果不包含强引用
             // 很显然它可能会被很多线程同时调用，因为可能会派发相同的链路
             Box::new(move || {
-                if let Some(task) = selected_link.clone().delay() {
+                if let Some(task) = selected_link.clone().deacitve() {
                     delay_task_sender.try_send(task)?;
                     Ok(())
                 }

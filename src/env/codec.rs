@@ -9,21 +9,21 @@ pub struct MsgCodec;
 
 impl MsgCodec {
     const HEADER_LEN: usize = size_of::<u16>() + size_of::<u8>();
-    const MSG_MAX_LEN: usize = 9999;
+    const MSG_MAX_LEN: usize = 9999; // todo
 }
 
 impl Encoder<Msg> for MsgCodec {
     type Error = anyhow::Error;
-
     fn encode(&mut self, item: Msg, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let msg = bincode::serialize(&item)?;
+        let mut msg_buf = vec![]; // todo 内存分配优化
+        let msg_len = bincode::encode_into_slice(item, &mut msg_buf, bincode::config::standard())?;
         dst.extend(
-            ((msg.len() + Self::HEADER_LEN) as u16)
+            ((msg_len + Self::HEADER_LEN) as u16)
                 .to_be_bytes()
                 .iter()
                 .copied()
                 .chain([global_config().protocol_version].iter().copied())
-                .chain(msg),
+                .chain(msg_buf),
         );
         Ok(())
     }
@@ -31,7 +31,7 @@ impl Encoder<Msg> for MsgCodec {
 
 impl Decoder for MsgCodec {
     type Item = Msg;
-    type Error = bincode::Error;
+    type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < MsgCodec::HEADER_LEN {
@@ -47,7 +47,7 @@ impl Decoder for MsgCodec {
             return Ok(None);
         }
         if src.len() < msg_len {
-            // 消息长度大于当前缓冲区，请求扩容
+            // 消息长度大于当前缓冲区，请求扩容，等消息完整再取出
             src.reserve(msg_len - src.len());
             return Ok(None);
         }
@@ -56,8 +56,10 @@ impl Decoder for MsgCodec {
             src.advance(msg_len);
             return Ok(None);
         }
-        let msg = bincode::deserialize(&src.split_to(msg_len)[Self::HEADER_LEN..])?;
+        let (msg, _) = bincode::decode_from_slice::<Msg, _>(
+            &src.split_to(msg_len)[Self::HEADER_LEN..],
+            bincode::config::standard(),
+        )?;
         Ok(Some(msg))
     }
 }
-// 支持到事件的直接解码

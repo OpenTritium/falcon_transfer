@@ -1,5 +1,5 @@
+use bincode::{Decode, Encode};
 use nanoid::nanoid;
-use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     ops::{Deref, Not},
@@ -12,7 +12,7 @@ pub enum UidError {
     Invalid(String),
 }
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Encode,Decode)]
 pub struct Uid(String);
 
 impl Uid {

@@ -1,5 +1,6 @@
 #![feature(ip)]
 #![feature(duration_constructors)]
+#![feature(iter_next_chunk)]
 use std::future::pending;
 
 mod env;

@@ -1,9 +1,8 @@
 use crate::utils::{EndPoint, Uid};
-use serde::{Deserialize, Serialize};
-
+use bincode::{Decode, Encode};
 use super::HandshakeState;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Encode,Decode)]
 pub enum Msg {
     /// 发明报文用于构建链路状态表，这里包含的是对方的uid和地址
     Discovery {
@@ -31,5 +30,3 @@ impl<'a> Msg {
         }
     }
 }
-
-

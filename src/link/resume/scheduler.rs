@@ -1,4 +1,4 @@
-use super::ResumeTask;
+use super::task::ResumeTask;
 use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -10,8 +10,6 @@ use tokio_util::time::DelayQueue;
 
 #[derive(Debug, Error)]
 pub enum ResumeTaskError {
-    #[error("the link_state entry has been removed bt another thread.")]
-    RemovedByOtherThread,
     #[error(transparent)]
     TaskSendError(#[from] TrySendError<ResumeTask>),
 }

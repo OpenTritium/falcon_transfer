@@ -1,4 +1,4 @@
-use crate::env::{global_config, MsgCodec, NicView};
+use crate::env::{MsgCodec, NicView, global_config};
 use crate::utils::{EndPoint, Msg};
 use anyhow::{Ok, Result};
 use dashmap::DashMap;
@@ -25,16 +25,16 @@ async fn create_socket(addr: &EndPoint) -> Result<UdpSocket> {
 }
 
 pub async fn split_group() -> Result<MsgSinkStreamGroup> {
-    Ok(futures::future::try_join_all(
-        NicView::default()
-            .filter(|iface| !iface.is_lan())
-            .map(async |iface| {
+    Ok(
+        futures::future::try_join_all(NicView::default().filter(|iface| !iface.is_lan()).map(
+            async |iface| {
                 let addr = EndPoint::new(iface, global_config().protocol_port);
                 let sock = create_socket(&addr).await?;
                 Ok((addr, UdpFramed::new(sock, MsgCodec).split()))
-            }),
-    )
+            },
+        ))
         .await?
         .into_iter()
-        .collect())
+        .collect(),
+    )
 }
