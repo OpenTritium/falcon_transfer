@@ -21,6 +21,7 @@ pub enum Msg {
         task_id: Uid,
         seq: u64,
     },
+    // todo CheckSum 信息
 }
 
 impl<'a> Msg {
@@ -31,5 +32,3 @@ impl<'a> Msg {
         }
     }
 }
-
-
