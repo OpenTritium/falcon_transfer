@@ -24,6 +24,7 @@ pub struct FileRange {
 }
 
 impl FileRange {
+    #[inline]
     pub fn try_new(start: usize, end: usize) -> Option<Self> {
         if start < end {
             Some(Self { start, end })
@@ -39,17 +40,18 @@ impl FileRange {
 
     #[inline]
     pub fn intersect(&self, other: &Self) -> Option<Self> {
-        if self.start < other.end && other.start < self.end {
-            Self::try_new(self.start.max(other.start), self.end.min(other.end))
-        } else {
-            None
-        }
+        let start = self.start.max(other.start);
+        let end = self.end.min(other.end);
+        (start < end).then(|| Self { start, end })
     }
 
     #[inline]
     pub fn union(&self, other: &Self) -> Option<Self> {
         if self.end >= other.start && other.end >= self.start {
-            Self::try_new(self.start.min(other.start), self.end.max(other.end))
+            Some(Self {
+                start: self.start.min(other.start),
+                end: self.end.max(other.end),
+            })
         } else {
             None
         }
@@ -57,21 +59,19 @@ impl FileRange {
 
     #[inline]
     pub fn subtract(&self, other: &Self) -> [Option<FileRange>; 2] {
-        let mut result = [None, None];
         let intersection = match self.intersect(other) {
             Some(v) => v,
-            None => {
-                result[0] = Some(*self);
-                return result;
-            }
+            None => return [Some(*self), None],
         };
-        if self.start < intersection.start {
-            result[0] = FileRange::try_new(self.start, intersection.start)
-        }
-        if self.end > intersection.end {
-            result[1] = FileRange::try_new(intersection.end, self.end)
-        }
-        result
+
+        [
+            (self.start < intersection.start)
+                .then(|| FileRange::try_new(self.start, intersection.start))
+                .flatten(),
+            (self.end > intersection.end)
+                .then(|| FileRange::try_new(intersection.end, self.end))
+                .flatten(),
+        ]
     }
 
     #[inline]
@@ -83,6 +83,7 @@ impl FileRange {
 impl Eq for FileRange {}
 
 impl From<FileRange> for FileMultiRange {
+    #[inline]
     fn from(rgn: FileRange) -> Self {
         Self {
             ranges: smallvec![rgn],
@@ -91,24 +92,28 @@ impl From<FileRange> for FileMultiRange {
 }
 
 impl From<FileRange> for Range<usize> {
+    #[inline]
     fn from(rgn: FileRange) -> Self {
         rgn.start..rgn.end
     }
 }
 
 impl From<FileRange> for RangeInclusive<usize> {
+    #[inline]
     fn from(rgn: FileRange) -> Self {
         rgn.start..=rgn.end - 1
     }
 }
 
 impl PartialOrd for FileRange {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.start.partial_cmp(&other.start)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FileRange {
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.start.cmp(&other.start)
     }
@@ -116,6 +121,7 @@ impl Ord for FileRange {
 
 impl TryFrom<Range<usize>> for FileRange {
     type Error = FileRangeError;
+    #[inline]
     fn try_from(rgn: Range<usize>) -> Result<Self, Self::Error> {
         let (start, end) = extract_range_bounds(&rgn)?;
         Ok(FileRange { start, end })
@@ -124,6 +130,7 @@ impl TryFrom<Range<usize>> for FileRange {
 
 impl TryFrom<RangeInclusive<usize>> for FileRange {
     type Error = FileRangeError;
+    #[inline]
     fn try_from(rgn: RangeInclusive<usize>) -> Result<Self, Self::Error> {
         let (start, end) = extract_range_bounds(&rgn)?;
         Ok(FileRange { start, end })
@@ -132,6 +139,7 @@ impl TryFrom<RangeInclusive<usize>> for FileRange {
 
 impl TryFrom<(Bound<usize>, Bound<usize>)> for FileRange {
     type Error = FileRangeError;
+    #[inline]
     fn try_from(rgn: (Bound<usize>, Bound<usize>)) -> Result<Self, Self::Error> {
         let (start, end) = extract_range_bounds(&rgn)?;
         Ok(FileRange { start, end })
@@ -143,24 +151,28 @@ pub trait ToRangeBoundPair {
 }
 
 impl ToRangeBoundPair for Range<usize> {
+    #[inline]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (Bound::Included(self.start), Bound::Excluded(self.end))
     }
 }
 
 impl ToRangeBoundPair for RangeInclusive<usize> {
+    #[inline]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (Bound::Included(*self.start()), Bound::Included(*self.end()))
     }
 }
 
 impl ToRangeBoundPair for (Bound<usize>, Bound<usize>) {
+    #[inline]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (self.0, self.1)
     }
 }
 
 impl ToRangeBoundPair for FileRange {
+    #[inline]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (Bound::Included(self.start), Bound::Excluded(self.end))
     }
@@ -172,6 +184,7 @@ pub struct FileMultiRange {
 }
 
 impl FileMultiRange {
+    #[inline]
     pub fn new() -> Self {
         Self {
             ranges: smallvec![],
@@ -191,25 +204,32 @@ impl FileMultiRange {
     }
 
     fn merge_around(&mut self, pos: usize) {
-        let mut merge_pos = pos;
+        let mut start = pos;
+        let mut end = pos;
 
-        // 向前合并
-        while merge_pos > 0 && self.ranges[merge_pos - 1].end >= self.ranges[merge_pos].start {
-            self.ranges[merge_pos - 1].end = self.ranges[merge_pos - 1]
-                .end
-                .max(self.ranges[merge_pos].end);
-            self.ranges.remove(merge_pos);
-            merge_pos -= 1;
+        // Expand left
+        while start > 0 && self.ranges[start - 1].end >= self.ranges[start].start {
+            start -= 1;
         }
 
-        // 向后合并
-        while merge_pos < self.ranges.len().saturating_sub(1)
-            && self.ranges[merge_pos].end >= self.ranges[merge_pos + 1].start
+        // Expand right
+        while end < self.ranges.len().saturating_sub(1)
+            && self.ranges[end].end >= self.ranges[end + 1].start
         {
-            self.ranges[merge_pos].end = self.ranges[merge_pos]
-                .end
-                .max(self.ranges[merge_pos + 1].end);
-            self.ranges.remove(merge_pos + 1);
+            end += 1;
+        }
+
+        if start < end {
+            let merged_start = self.ranges[start].start;
+            let merged_end = self.ranges[end].end;
+            self.ranges.drain(start..=end);
+            self.ranges.insert(
+                start,
+                FileRange {
+                    start: merged_start,
+                    end: merged_end,
+                },
+            );
         }
     }
 
@@ -221,12 +241,12 @@ impl FileMultiRange {
         let mut merged = smallvec![];
         let mut current = self.ranges[0];
 
-        for range in &self.ranges[1..] {
+        for &range in &self.ranges[1..] {
             if range.start <= current.end {
                 current.end = current.end.max(range.end);
             } else {
                 merged.push(current);
-                current = *range;
+                current = range;
             }
         }
 
@@ -238,9 +258,9 @@ impl FileMultiRange {
         let mut result = Self::new();
         let (mut i, mut j) = (0, 0);
 
-        while i < self.len() && j < other.len() {
-            let a = self.ranges[i];
-            let b = other.ranges[j];
+        while i < self.ranges.len() && j < other.ranges.len() {
+            let a = &self.ranges[i];
+            let b = &other.ranges[j];
 
             let start = a.start.max(b.start);
             let end = a.end.min(b.end);
@@ -266,8 +286,8 @@ impl FileMultiRange {
         for &range in &self.ranges {
             let mut current = range;
 
-            while other_idx < other.len() && current.start < current.end {
-                let sub = other.ranges[other_idx];
+            while other_idx < other.ranges.len() && current.start < current.end {
+                let sub = &other.ranges[other_idx];
 
                 if sub.end <= current.start {
                     other_idx += 1;
@@ -317,7 +337,6 @@ impl FileMultiRange {
     }
 }
 
-// 调整泛型实现以提升可读性
 impl<T> TryFrom<&[T]> for FileMultiRange
 where
     T: ToRangeBoundPair + Clone,
@@ -335,12 +354,13 @@ where
     }
 }
 
-// 区间解析工具函数
 #[inline]
 fn extract_range_bounds(rgn: &impl ToRangeBoundPair) -> Result<(usize, usize), FileRangeError> {
     use Bound::*;
     use FileRangeError::*;
+
     let (start, end) = rgn.to_bound_pair();
+
     let start = match start {
         Included(s) => Ok(s),
         Excluded(s) => s.checked_add(1).ok_or(IndexOverflow),
