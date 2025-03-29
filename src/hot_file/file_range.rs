@@ -1,19 +1,23 @@
-use smallvec::SmallVec;
-use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
+use smallvec::{SmallVec, smallvec};
+use std::ops::{Bound, Range, RangeInclusive};
 use thiserror::Error;
 
-#[macro_export]
-macro_rules! rangify {
-    ($range:expr) => {{ $crate::hot_file::FileRange::try_from($crate::hot_file::RangeBoundsWrapper($range)) }};
-    (start = $start:expr, end = $end:expr) => {{ $crate::hot_file::FileRange::try_from($crate::hot_file::RangeBoundsWrapper($start..$end)) }};
-    (.. $end:expr) => {{ $crate::hot_file::rgnInclusive::try_from($crate::RangeBoundsWrapper(..$end)) }};
+const STACK_BUFFERED: usize = 8;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum FileRangeError {
+    #[error("Invalid range: {start:?} - {end:?}")]
+    InvalidRange {
+        start: Bound<usize>,
+        end: Bound<usize>,
+    },
+    #[error("Index overflow")]
+    IndexOverflow,
+    #[error("Index out of bounds")]
+    IndexUnbounded,
 }
 
-#[derive(Debug)]
-pub struct RangeBoundsWrapper<T>(pub T);
-
 #[derive(Debug, PartialEq, Clone, Hash, Copy)]
-/// 左闭右开
 pub struct FileRange {
     pub start: usize,
     pub end: usize,
@@ -28,6 +32,7 @@ impl FileRange {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.end - self.start
     }
@@ -43,7 +48,7 @@ impl FileRange {
 
     #[inline]
     pub fn union(&self, other: &Self) -> Option<Self> {
-        if self.start <= other.end || self.end >= other.start {
+        if self.end >= other.start && other.end >= self.start {
             Self::try_new(self.start.min(other.start), self.end.max(other.end))
         } else {
             None
@@ -51,35 +56,27 @@ impl FileRange {
     }
 
     #[inline]
-    pub fn subtract(&self, other: &Self) -> Option<Self> {
-        let intersection = self.intersect(other)?;
-        if intersection == *self {
-            return None;
+    pub fn subtract(&self, other: &Self) -> [Option<FileRange>; 2] {
+        let mut result = [None, None];
+        let intersection = match self.intersect(other) {
+            Some(v) => v,
+            None => {
+                result[0] = Some(*self);
+                return result;
+            }
+        };
+        if self.start < intersection.start {
+            result[0] = FileRange::try_new(self.start, intersection.start)
         }
-        let left_subtract = intersection.start == self.start && intersection.end < self.end;
-        let right_subtract = intersection.end == self.end && intersection.start > self.start;
-        match (left_subtract, right_subtract) {
-            (true, false) => FileRange::try_new(intersection.end, self.end),
-            (false, true) => FileRange::try_new(self.start, intersection.start),
-            _ => None,
+        if self.end > intersection.end {
+            result[1] = FileRange::try_new(intersection.end, self.end)
         }
+        result
     }
 
     #[inline]
     pub fn contains(&self, other: &Self) -> bool {
         self.start <= other.start && self.end >= other.end
-    }
-
-    // todo 废弃
-    pub fn get<T>(self, slice: &[T]) -> Option<&[T]> {
-        let range: Range<usize> = self.into();
-        slice.get(range)
-    }
-
-    //todo 废弃
-    pub fn get_mut<T>(self, slice: &mut [T]) -> Option<&mut [T]> {
-        let range: Range<usize> = self.into();
-        slice.get_mut(range)
     }
 }
 
@@ -87,9 +84,8 @@ impl Eq for FileRange {}
 
 impl From<FileRange> for FileMultiRange {
     fn from(rgn: FileRange) -> Self {
-        use smallvec::smallvec;
-        FileMultiRange {
-            inner: smallvec![rgn],
+        Self {
+            ranges: smallvec![rgn],
         }
     }
 }
@@ -106,16 +102,6 @@ impl From<FileRange> for RangeInclusive<usize> {
     }
 }
 
-impl RangeBounds<usize> for FileRange {
-    fn start_bound(&self) -> Bound<&usize> {
-        Bound::Included(&self.start)
-    }
-
-    fn end_bound(&self) -> Bound<&usize> {
-        Bound::Excluded(&self.end)
-    }
-}
-
 impl PartialOrd for FileRange {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.start.partial_cmp(&other.start)
@@ -128,469 +114,411 @@ impl Ord for FileRange {
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
-pub enum FileRangeError {
-    #[error("Invalid range: {start:?} - {end:?}")]
-    InvalidRange {
-        start: Bound<usize>,
-        end: Bound<usize>,
-    },
-    #[error("Index overflow")]
-    IndexOverflow,
-}
-
-impl<T: RangeBounds<usize>> TryFrom<RangeBoundsWrapper<T>> for FileRange {
+impl TryFrom<Range<usize>> for FileRange {
     type Error = FileRangeError;
-
-    fn try_from(range: RangeBoundsWrapper<T>) -> Result<Self, Self::Error> {
-        let range = range.0;
-        let start = match range.start_bound() {
-            Bound::Included(&s) => Some(s),
-            Bound::Excluded(&s) => Some(s.checked_add(1).ok_or(FileRangeError::IndexOverflow)?),
-            Bound::Unbounded => None,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(&e) => Some(e.checked_add(1).ok_or(FileRangeError::IndexOverflow)?),
-            Bound::Excluded(&e) => Some(e),
-            Bound::Unbounded => None,
-        };
-        if let (Some(start), Some(end)) = (start, end)
-            && start < end
-        {
-            Ok(Self { start, end })
-        } else {
-            Err(FileRangeError::InvalidRange {
-                start: range.start_bound().cloned(),
-                end: range.end_bound().cloned(),
-            })
-        }
+    fn try_from(rgn: Range<usize>) -> Result<Self, Self::Error> {
+        let (start, end) = extract_range_bounds(&rgn)?;
+        Ok(FileRange { start, end })
     }
 }
 
-pub type StackAllocatedPefered = SmallVec<[FileRange; 16]>;
+impl TryFrom<RangeInclusive<usize>> for FileRange {
+    type Error = FileRangeError;
+    fn try_from(rgn: RangeInclusive<usize>) -> Result<Self, Self::Error> {
+        let (start, end) = extract_range_bounds(&rgn)?;
+        Ok(FileRange { start, end })
+    }
+}
 
-#[derive(Debug, Clone)]
+impl TryFrom<(Bound<usize>, Bound<usize>)> for FileRange {
+    type Error = FileRangeError;
+    fn try_from(rgn: (Bound<usize>, Bound<usize>)) -> Result<Self, Self::Error> {
+        let (start, end) = extract_range_bounds(&rgn)?;
+        Ok(FileRange { start, end })
+    }
+}
+
+pub trait ToRangeBoundPair {
+    fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>);
+}
+
+impl ToRangeBoundPair for Range<usize> {
+    fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
+        (Bound::Included(self.start), Bound::Excluded(self.end))
+    }
+}
+
+impl ToRangeBoundPair for RangeInclusive<usize> {
+    fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
+        (Bound::Included(*self.start()), Bound::Included(*self.end()))
+    }
+}
+
+impl ToRangeBoundPair for (Bound<usize>, Bound<usize>) {
+    fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
+        (self.0, self.1)
+    }
+}
+
+impl ToRangeBoundPair for FileRange {
+    fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
+        (Bound::Included(self.start), Bound::Excluded(self.end))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileMultiRange {
-    pub inner: StackAllocatedPefered,
+    ranges: SmallVec<[FileRange; STACK_BUFFERED]>,
 }
 
 impl FileMultiRange {
-    pub fn new(rngs: &[impl RangeBounds<usize> + Clone]) -> Self {
-        let rgns: StackAllocatedPefered = rngs
-            .into_iter()
-            .map(|rng| {
-                FileRange::try_from(RangeBoundsWrapper(rng.clone())).expect("Invalid range bounds")
-            })
-            .collect();
-        let mut mask = Self { inner: rgns };
-        mask.merge();
-        mask
+    pub fn new() -> Self {
+        Self {
+            ranges: smallvec![],
+        }
     }
 
-    pub fn add(&mut self, rng: impl RangeBounds<usize>) -> Result<(), FileRangeError> {
-        let rgn = rangify!(rng)?;
-        self.inner.push(rgn);
-        self.merge();
+    fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
+        let range = FileRange::try_new(start, end).ok_or(FileRangeError::InvalidRange {
+            start: Bound::Included(start),
+            end: Bound::Excluded(end),
+        })?;
+
+        let pos = self.ranges.partition_point(|r| r.start <= range.start);
+        self.ranges.insert(pos, range);
+        self.merge_around(pos);
         Ok(())
     }
 
-    #[inline]
+    fn merge_around(&mut self, pos: usize) {
+        let mut merge_pos = pos;
+
+        // 向前合并
+        while merge_pos > 0 && self.ranges[merge_pos - 1].end >= self.ranges[merge_pos].start {
+            self.ranges[merge_pos - 1].end = self.ranges[merge_pos - 1]
+                .end
+                .max(self.ranges[merge_pos].end);
+            self.ranges.remove(merge_pos);
+            merge_pos -= 1;
+        }
+
+        // 向后合并
+        while merge_pos < self.ranges.len().saturating_sub(1)
+            && self.ranges[merge_pos].end >= self.ranges[merge_pos + 1].start
+        {
+            self.ranges[merge_pos].end = self.ranges[merge_pos]
+                .end
+                .max(self.ranges[merge_pos + 1].end);
+            self.ranges.remove(merge_pos + 1);
+        }
+    }
+
     pub fn merge(&mut self) {
-        self.inner.sort_unstable_by_key(|rgn| rgn.start);
-        let mut merged: StackAllocatedPefered = SmallVec::new();
-        for rgn in std::mem::take(&mut self.inner) {
-            if let Some(last) = merged.last_mut() {
-                if rgn.start <= last.end {
-                    last.end = last.end.max(rgn.end);
-                } else {
-                    merged.push(rgn);
-                }
+        if self.ranges.is_empty() {
+            return;
+        }
+
+        let mut merged = smallvec![];
+        let mut current = self.ranges[0];
+
+        for range in &self.ranges[1..] {
+            if range.start <= current.end {
+                current.end = current.end.max(range.end);
             } else {
-                merged.push(rgn);
+                merged.push(current);
+                current = *range;
             }
         }
-        self.inner = merged;
+
+        merged.push(current);
+        self.ranges = merged;
     }
 
     pub fn intersect(&self, other: &Self) -> Self {
-        let mut rgns = StackAllocatedPefered::new();
+        let mut result = Self::new();
         let (mut i, mut j) = (0, 0);
 
-        while i != self.inner.len() && j != other.inner.len() {
-            let a = &self.inner[i];
-            let b = &other.inner[j];
-            if let Some(intersection) = a.intersect(b) {
-                rgns.push(intersection);
+        while i < self.len() && j < other.len() {
+            let a = self.ranges[i];
+            let b = other.ranges[j];
+
+            let start = a.start.max(b.start);
+            let end = a.end.min(b.end);
+
+            if start < end {
+                result.ranges.push(FileRange { start, end });
             }
+
             if a.end <= b.end {
                 i += 1;
             } else {
                 j += 1;
             }
         }
-        Self { inner: rgns }
-    }
 
-    pub fn union(&self, other: &Self) -> Self {
-        let mut merged = self.inner.clone();
-        merged.extend(other.inner.iter().cloned());
-        let mut res = Self { inner: merged };
-        res.merge();
-        res
+        result
     }
 
     pub fn subtract(&self, other: &Self) -> Self {
-        let mut cur_rgns = self.inner.clone();
-        for sub in &other.inner {
-            let mut next_rgns = StackAllocatedPefered::new();
-            for current in cur_rgns {
-                let mut tmp = current;
-                let left_end = std::cmp::min(sub.start, tmp.end);
-                if let Some(left) = FileRange::try_new(tmp.start, left_end) {
-                    if left.start < left.end {
-                        next_rgns.push(left);
-                        tmp.start = left_end;
-                    }
+        let mut result = Self::new();
+        let mut other_idx = 0;
+
+        for &range in &self.ranges {
+            let mut current = range;
+
+            while other_idx < other.len() && current.start < current.end {
+                let sub = other.ranges[other_idx];
+
+                if sub.end <= current.start {
+                    other_idx += 1;
+                    continue;
                 }
-                let right_start = std::cmp::max(sub.end, tmp.start);
-                if let Some(right) = FileRange::try_new(right_start, tmp.end) {
-                    if right.start < right.end {
-                        next_rgns.push(right);
-                        tmp.end = right_start;
-                    }
+
+                if sub.start >= current.end {
+                    break;
                 }
-                if tmp.start < tmp.end {
-                    if let Some(remaining) = tmp.subtract(sub) {
-                        next_rgns.push(remaining);
-                    }
+
+                if current.start < sub.start {
+                    result.ranges.push(FileRange {
+                        start: current.start,
+                        end: sub.start,
+                    });
                 }
+
+                current.start = current.start.max(sub.end);
+                if sub.end > current.end {
+                    break;
+                }
+
+                other_idx += 1;
             }
-            cur_rgns = next_rgns;
+
+            if current.start < current.end {
+                result.ranges.push(current);
+            }
         }
-        let mut rst = Self { inner: cur_rgns };
-        rst.merge();
-        rst
+
+        result
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    #[inline]
+    pub fn total_len(&self) -> usize {
+        self.ranges.iter().map(|r| r.len()).sum()
+    }
+}
+
+// 调整泛型实现以提升可读性
+impl<T> TryFrom<&[T]> for FileMultiRange
+where
+    T: ToRangeBoundPair + Clone,
+{
+    type Error = FileRangeError;
+
+    fn try_from(ranges: &[T]) -> Result<Self, Self::Error> {
+        let mut rgns = Self::new();
+        for range in ranges {
+            let (start, end) = extract_range_bounds(range)?;
+            rgns.add_checked(start, end)?;
+        }
+        rgns.merge();
+        Ok(rgns)
+    }
+}
+
+// 区间解析工具函数
+#[inline]
+fn extract_range_bounds(rgn: &impl ToRangeBoundPair) -> Result<(usize, usize), FileRangeError> {
+    use Bound::*;
+    use FileRangeError::*;
+    let (start, end) = rgn.to_bound_pair();
+    let start = match start {
+        Included(s) => Ok(s),
+        Excluded(s) => s.checked_add(1).ok_or(IndexOverflow),
+        Unbounded => Err(IndexUnbounded),
+    }?;
+
+    let end = match end {
+        Included(e) => e.checked_add(1).ok_or(IndexOverflow),
+        Excluded(e) => Ok(e),
+        Unbounded => Err(IndexUnbounded),
+    }?;
+
+    if start < end {
+        Ok((start, end))
+    } else {
+        Err(InvalidRange {
+            start: Included(start),
+            end: Excluded(end),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Bound::*;
     use smallvec::smallvec_inline;
-    use std::ops::Bound;
 
     #[test]
-    fn valid_rgn_conversion() {
-        let rgn = rangify!(1..=5).unwrap();
-        assert_eq!(rgn, FileRange::try_new(1, 6).unwrap());
-
-        let rgn = rangify!(1..5).unwrap();
-        assert_eq!(rgn, FileRange::try_new(1, 5).unwrap());
-
-        let result = rangify!(..5);
+    fn filerange_try_new() {
         assert_eq!(
-            result,
+            FileRange::try_new(1, 3),
+            Some(FileRange { start: 1, end: 3 })
+        );
+        assert_eq!(FileRange::try_new(2, 2), None);
+        assert_eq!(FileRange::try_new(3, 1), None);
+    }
+
+    #[test]
+    fn filerange_intersect() {
+        let r1 = FileRange { start: 1, end: 5 };
+        let r2 = FileRange { start: 3, end: 7 };
+        assert_eq!(r1.intersect(&r2), FileRange::try_new(3, 5));
+
+        let r3 = FileRange { start: 5, end: 10 };
+        assert_eq!(r1.intersect(&r3), None);
+    }
+
+    #[test]
+    fn filerange_union() {
+        let r1 = FileRange { start: 1, end: 3 };
+        let r2 = FileRange { start: 2, end: 4 };
+        assert_eq!(r1.union(&r2), FileRange::try_new(1, 4));
+
+        let r1 = FileRange { start: 1, end: 3 };
+        let r2 = FileRange { start: 3, end: 4 };
+        assert_eq!(r1.union(&r2), FileRange::try_new(1, 4));
+
+        let r3 = FileRange { start: 5, end: 7 };
+        assert_eq!(r1.union(&r3), None);
+    }
+
+    #[test]
+    fn filerange_subtract() {
+        let r1 = FileRange { start: 1, end: 10 };
+        let r2 = FileRange { start: 3, end: 7 };
+        let res = r1.subtract(&r2);
+        assert_eq!(res, [FileRange::try_new(1, 3), FileRange::try_new(7, 10)]);
+
+        let r3 = FileRange { start: 0, end: 5 };
+        let res2 = r1.subtract(&r3);
+        assert_eq!(res2, [None, FileRange::try_new(5, 10)]);
+
+        let r4 = FileRange { start: 1, end: 10 };
+        let res3 = r1.subtract(&r4);
+        assert_eq!(res3, [None, None]);
+    }
+
+    #[test]
+    fn filerange_contains() {
+        let r1 = FileRange { start: 2, end: 8 };
+        let r2 = FileRange { start: 3, end: 5 };
+        assert!(r1.contains(&r2));
+
+        let r3 = FileRange { start: 1, end: 9 };
+        assert!(!r1.contains(&r3));
+    }
+
+    #[test]
+    fn extract_valid_range() {
+        assert_eq!(extract_range_bounds(&(1..5)), Ok((1, 5)));
+        assert_eq!(extract_range_bounds(&(2..=6)), Ok((2, 7)));
+        assert_eq!(
+            extract_range_bounds(&(Included(3), Excluded(5))),
+            Ok((3, 5))
+        );
+    }
+
+    #[test]
+    fn parse_invalid_range() {
+        assert_eq!(
+            extract_range_bounds(&(5..3)),
             Err(FileRangeError::InvalidRange {
-                start: Bound::Unbounded,
-                end: Bound::Excluded(5)
+                start: Included(5),
+                end: Excluded(3)
+            })
+        );
+        assert_eq!(
+            extract_range_bounds(&(Included(usize::MAX), Excluded(0))),
+            Err(FileRangeError::InvalidRange {
+                start: Included(usize::MAX),
+                end: Excluded(0)
+            })
+        );
+        assert_eq!(
+            extract_range_bounds(&(Included(0), Excluded(0))),
+            Err(FileRangeError::InvalidRange {
+                start: Included(0),
+                end: Excluded(0)
             })
         );
     }
 
     #[test]
-    fn start_moreover_end() {
-        let result = rangify!(5..1);
-        assert_eq!(
-            result,
-            Err(FileRangeError::InvalidRange {
-                start: Bound::Included(5),
-                end: Bound::Excluded(1)
-            })
-        );
+    fn multirange_add_and_merge() {
+        let mut mr = FileMultiRange::new();
+        mr.add_checked(1, 3).unwrap();
+        mr.add_checked(2, 5).unwrap();
+        assert_eq!(mr.ranges, smallvec_inline![FileRange { start: 1, end: 5 }]);
 
-        let result = rangify!(2..2);
+        mr.add_checked(7, 10).unwrap();
         assert_eq!(
-            result,
-            Err(FileRangeError::InvalidRange {
-                start: Bound::Included(2),
-                end: Bound::Excluded(2)
-            })
-        );
-    }
-
-    #[test]
-    fn mask_merging() {
-        let mask = FileMultiRange::new(smallvec_inline![1..3, 4..6, 7..9].as_slice());
-        assert_eq!(
-            mask.inner,
+            mr.ranges,
             smallvec_inline![
-                FileRange::try_new(1, 3).unwrap(),
-                FileRange::try_new(4, 6).unwrap(),
-                FileRange::try_new(7, 9).unwrap()
-            ]
-        );
-
-        let mask = FileMultiRange::new(smallvec_inline![1..5, 3..7, 6..9].as_slice());
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(1, 9).unwrap()]
-        );
-
-        let mask = FileMultiRange::new(smallvec_inline![1..10, 2..5, 3..6].as_slice());
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(1, 10).unwrap()]
-        );
-
-        let mask = FileMultiRange::new(smallvec_inline![1..5, 5..8].as_slice());
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(1, 8).unwrap()]
-        );
-
-        let mask = FileMultiRange::new(smallvec_inline![5..8, 1..3, 2..6, 10..12].as_slice());
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![
-                FileRange::try_new(1, 8).unwrap(),
-                FileRange::try_new(10, 12).unwrap()
+                FileRange { start: 1, end: 5 },
+                FileRange { start: 7, end: 10 }
             ]
         );
     }
 
     #[test]
-    #[should_panic(expected = "Invalid range bounds")]
-    fn invalid_range() {
-        let _ = FileMultiRange::new(smallvec_inline![100..=50].as_slice());
-    }
-
-    #[test]
-    fn inclusive_range_merging() {
-        let rgn = rangify!(5..=5).unwrap();
-        assert_eq!(rgn, FileRange::try_new(5, 6).unwrap());
-
-        let mask = FileMultiRange::new(smallvec_inline![1..=5, 5..=8].as_slice());
+    fn multirange_intersect() {
+        let mr1 = FileMultiRange::try_from([1..5, 8..12].as_slice()).unwrap();
+        let mr2 = FileMultiRange::try_from([3..10].as_slice()).unwrap();
+        let res = mr1.intersect(&mr2);
         assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(1, 9).unwrap()]
-        );
-
-        let mask = FileMultiRange::new(smallvec_inline![1..=5, 7..=9].as_slice());
-        assert_eq!(
-            mask.inner,
+            res.ranges,
             smallvec_inline![
-                FileRange::try_new(1, 6).unwrap(),
-                FileRange::try_new(7, 10).unwrap()
+                FileRange { start: 3, end: 5 },
+                FileRange { start: 8, end: 10 }
             ]
         );
+    }
 
-        let mask = FileMultiRange::new(smallvec_inline![1..=5, 5..=8, 8..=10].as_slice());
+    #[test]
+    fn test_multirange_subtract() {
+        let mr1 = FileMultiRange::try_from([1..10].as_slice()).unwrap();
+        let mr2 = FileMultiRange::try_from([3..5, 7..9].as_slice()).unwrap();
+        let res = mr1.subtract(&mr2);
         assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(1, 11).unwrap()]
+            res.ranges,
+            smallvec_inline![
+                FileRange { start: 1, end: 3 },
+                FileRange { start: 5, end: 7 },
+                FileRange { start: 9, end: 10 }
+            ]
         );
     }
 
     #[test]
-    #[should_panic]
-    fn edge_cases() {
-        let mask = FileMultiRange::new(smallvec_inline![usize::MAX - 1..=usize::MAX].as_slice());
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(usize::MAX - 1, usize::MAX).unwrap()]
-        );
-    }
-
-    #[test]
-    fn macro_gen() {
-        assert_eq!(rangify!(1..5).unwrap(), FileRange { start: 1, end: 5 });
-
-        assert_eq!(rangify!(1..=5).unwrap(), FileRange { start: 1, end: 6 });
-
-        assert_eq!(
-            rangify!(start = 3, end = 7).unwrap(),
-            FileRange { start: 3, end: 7 }
-        );
-
-        let result = rangify!(..5);
+    fn bound_checks() {
         assert!(matches!(
-            result,
-            Err(FileRangeError::InvalidRange { start: _, end: _ })
+            FileRange::try_from((Unbounded, Included(5))),
+            Err(FileRangeError::IndexUnbounded)
         ));
-
-        let result = rangify!(5..1);
         assert!(matches!(
-            result,
-            Err(FileRangeError::InvalidRange { start: _, end: _ })
+            FileRange::try_from((Included(5), Unbounded)),
+            Err(FileRangeError::IndexUnbounded)
         ));
-    }
-
-    #[test]
-    fn macro_integration() {
-        let rg1: RangeInclusive<usize> = rangify!(1..5).unwrap().into();
-        let rg2: RangeInclusive<usize> = rangify!(start = 5, end = 8).unwrap().into();
-
-        let mask = FileMultiRange::new(smallvec_inline![rg1, rg2].as_slice());
-
-        assert_eq!(mask.inner, smallvec_inline![FileRange { start: 1, end: 8 }]);
-    }
-
-    #[test]
-    fn push_range() {
-        let mut mask = FileMultiRange::new(smallvec_inline![3..5, 1..2].as_slice()); // 乱序输入
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![
-                FileRange::try_new(1, 2).unwrap(),
-                FileRange::try_new(3, 5).unwrap()
-            ]
-        );
-
-        mask.add(2..4).unwrap();
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![FileRange::try_new(1, 5).unwrap()]
-        );
-
-        mask.add(6..8).unwrap();
-        assert_eq!(
-            mask.inner,
-            smallvec_inline![
-                FileRange::try_new(1, 5).unwrap(),
-                FileRange::try_new(6, 8).unwrap()
-            ]
-        );
-    }
-
-    #[test]
-    fn intersection() {
-        let rgn1 = FileRange::try_new(1, 5).unwrap();
-        let rgn2 = FileRange::try_new(3, 7).unwrap();
-        let intersection = rgn1.intersect(&rgn2);
-        assert_eq!(intersection, Some(FileRange::try_new(3, 5).unwrap()));
-
-        let rgn3 = FileRange::try_new(6, 10).unwrap();
-        let intersection = rgn1.intersect(&rgn3);
-        assert_eq!(intersection, None);
-
-        let rgn4 = FileRange::try_new(2, 4).unwrap();
-        let rgn5 = FileRange::try_new(4, 6).unwrap();
-        let intersection = rgn4.intersect(&rgn5);
-        assert_eq!(intersection, None);
-    }
-
-    #[test]
-    fn union() {
-        let rgn1 = FileRange::try_new(1, 5).unwrap();
-        let rgn2 = FileRange::try_new(3, 7).unwrap();
-        let union = rgn1.union(&rgn2);
-        assert_eq!(union, Some(FileRange::try_new(1, 7).unwrap()));
-
-        let rgn3 = FileRange::try_new(6, 10).unwrap();
-        let union = rgn1.union(&rgn3);
-        assert_eq!(union, Some(FileRange::try_new(1, 10).unwrap()));
-
-        let rgn4 = FileRange::try_new(2, 4).unwrap();
-        let rgn5 = FileRange::try_new(4, 6).unwrap();
-        let union = rgn4.union(&rgn5);
-        assert_eq!(union, Some(FileRange::try_new(2, 6).unwrap()));
-    }
-
-    #[test]
-    fn contains() {
-        let rgn1 = FileRange::try_new(1, 5).unwrap();
-        let rgn2 = FileRange::try_new(2, 4).unwrap();
-        assert!(rgn1.contains(&rgn2));
-
-        let rgn3 = FileRange::try_new(0, 6).unwrap();
-        assert!(!rgn1.contains(&rgn3));
-
-        let rgn4 = FileRange::try_new(1, 5).unwrap();
-        assert!(rgn1.contains(&rgn4));
-    }
-
-    #[test]
-    fn subtract() {
-        // 右端差集
-        let a = FileRange::try_new(1, 6).unwrap();
-        let b = FileRange::try_new(4, 8).unwrap();
-        assert_eq!(a.subtract(&b), Some(FileRange::try_new(1, 4).unwrap()));
-        assert_eq!(b.subtract(&a), Some(FileRange::try_new(6, 8).unwrap()));
-
-        // 左端差集
-        let c = FileRange::try_new(5, 9).unwrap();
-        let d = FileRange::try_new(3, 7).unwrap();
-        assert_eq!(c.subtract(&d), Some(FileRange::try_new(7, 9).unwrap()));
-        assert_eq!(d.subtract(&c), Some(FileRange::try_new(3, 5).unwrap()));
-
-        // 中间交集
-        let e = FileRange::try_new(2, 8).unwrap();
-        let f = FileRange::try_new(4, 6).unwrap();
-        assert_eq!(e.subtract(&f), None);
-
-        // 完全覆盖
-        let g = FileRange::try_new(3, 5).unwrap();
-        let h = FileRange::try_new(2, 6).unwrap();
-        assert_eq!(g.subtract(&h), None);
-    }
-
-    #[test]
-    fn multi_set_operations() {
-        // 测试交集
-        let a = FileMultiRange::new(&[1..5, 8..12]);
-        let b = FileMultiRange::new(&[3..10, 15..20]);
-        let intersection = a.intersect(&b);
-        assert_eq!(
-            intersection.inner,
-            smallvec_inline![
-                FileRange::try_new(3, 5).unwrap(),
-                FileRange::try_new(8, 10).unwrap()
-            ]
-        );
-
-        // 测试并集
-        let union = a.union(&b);
-        assert_eq!(
-            union.inner,
-            smallvec_inline![
-                FileRange::try_new(1, 12).unwrap(),
-                FileRange::try_new(15, 20).unwrap()
-            ]
-        );
-
-        // 测试差集（A - B）
-        let subtraction = a.subtract(&b);
-        assert_eq!(
-            subtraction.inner,
-            smallvec_inline![
-                FileRange::try_new(1, 3).unwrap(),
-                FileRange::try_new(10, 12).unwrap()
-            ]
-        );
-
-        // 复杂差集测试
-        let complex_a = FileMultiRange::new(&[0..20]);
-        let complex_b = FileMultiRange::new(&[2..5, 8..12, 15..18]);
-        let diff = complex_a.subtract(&complex_b);
-        assert_eq!(
-            diff.inner,
-            smallvec_inline![
-                FileRange::try_new(0, 2).unwrap(),
-                FileRange::try_new(5, 8).unwrap(),
-                FileRange::try_new(12, 15).unwrap(),
-                FileRange::try_new(18, 20).unwrap()
-            ]
-        );
-
-        // 完全包含测试
-        let full_a = FileMultiRange::new(&[5..15]);
-        let full_b = FileMultiRange::new(&[8..12]);
-        assert_eq!(
-            full_a.subtract(&full_b).inner,
-            smallvec_inline![
-                FileRange::try_new(5, 8).unwrap(),
-                FileRange::try_new(12, 15).unwrap()
-            ]
-        );
     }
 }

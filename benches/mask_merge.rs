@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use falcon_transfer::hot_file::{FileRange, FileMultiRange};
+use falcon_transfer::hot_file::{FileMultiRange, FileRange};
 use rand::Rng;
 
 fn generate_test_data(n: usize, max_gap: usize) -> Vec<FileRange> {
@@ -23,7 +23,7 @@ fn bench_merge(c: &mut Criterion) {
         group.bench_with_input(format!("Sequential {}", size), &size, |b, &size| {
             let data = generate_test_data(size, 100);
             b.iter(|| {
-                let mask = FileMultiRange::new(data.as_slice());
+                let mask = FileMultiRange::try_from(data.as_slice()).unwrap();
                 black_box(mask);
             })
         });
