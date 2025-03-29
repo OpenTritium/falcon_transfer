@@ -1,5 +1,8 @@
 use smallvec::{SmallVec, smallvec};
-use std::ops::{Bound, Range, RangeInclusive};
+use std::{
+    hint::{likely, unlikely},
+    ops::{Bound, Range, RangeInclusive},
+};
 use thiserror::Error;
 
 const STACK_BUFFERED: usize = 8;
@@ -17,7 +20,7 @@ pub enum FileRangeError {
     IndexUnbounded,
 }
 
-#[derive(Debug, PartialEq, Clone, Hash, Copy)]
+#[derive(Debug, PartialEq, Clone, Hash, Copy, Eq)]
 pub struct FileRange {
     pub start: usize,
     pub end: usize,
@@ -26,15 +29,11 @@ pub struct FileRange {
 impl FileRange {
     #[inline]
     pub fn try_new(start: usize, end: usize) -> Option<Self> {
-        if start < end {
-            Some(Self { start, end })
-        } else {
-            None
-        }
+        likely(start < end).then(|| Self { start, end })
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.end - self.start
     }
 
@@ -42,12 +41,12 @@ impl FileRange {
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         let start = self.start.max(other.start);
         let end = self.end.min(other.end);
-        (start < end).then(|| Self { start, end })
+        likely(start < end).then(|| Self { start, end })
     }
 
     #[inline]
     pub fn union(&self, other: &Self) -> Option<Self> {
-        if self.end >= other.start && other.end >= self.start {
+        if likely(self.end >= other.start && other.end >= self.start) {
             Some(Self {
                 start: self.start.min(other.start),
                 end: self.end.max(other.end),
@@ -63,24 +62,27 @@ impl FileRange {
             Some(v) => v,
             None => return [Some(*self), None],
         };
-
+        let a_start = self.start;
+        let a_end = self.end;
+        let b_start = intersection.start;
+        let b_end = intersection.end;
         [
-            (self.start < intersection.start)
-                .then(|| FileRange::try_new(self.start, intersection.start))
-                .flatten(),
-            (self.end > intersection.end)
-                .then(|| FileRange::try_new(intersection.end, self.end))
-                .flatten(),
+            (a_start < b_start).then(|| FileRange {
+                start: a_start,
+                end: b_start,
+            }),
+            (a_end > b_end).then(|| FileRange {
+                start: b_end,
+                end: a_end,
+            }),
         ]
     }
 
     #[inline]
-    pub fn contains(&self, other: &Self) -> bool {
+    pub const fn contains(&self, other: &Self) -> bool {
         self.start <= other.start && self.end >= other.end
     }
 }
-
-impl Eq for FileRange {}
 
 impl From<FileRange> for FileMultiRange {
     #[inline]
@@ -187,7 +189,7 @@ impl FileMultiRange {
     #[inline]
     pub fn new() -> Self {
         Self {
-            ranges: smallvec![],
+            ranges: SmallVec::new(),
         }
     }
 
@@ -196,35 +198,82 @@ impl FileMultiRange {
             start: Bound::Included(start),
             end: Bound::Excluded(end),
         })?;
-
+        if unlikely(self.ranges.is_empty()) {
+            self.ranges.push(range);
+            return Ok(());
+        }
         let pos = self.ranges.partition_point(|r| r.start <= range.start);
-        self.ranges.insert(pos, range);
-        self.merge_around(pos);
+        let mut merge_left = false;
+        let mut merge_right = false;
+        if pos > 0 && likely(self.ranges[pos - 1].end >= range.start) {
+            self.ranges[pos - 1].end = self.ranges[pos - 1].end.max(range.end);
+            merge_left = true;
+        }
+        if pos < self.ranges.len() && self.ranges[pos].start <= range.end {
+            self.ranges[pos].start = self.ranges[pos].start.min(range.start);
+            self.ranges[pos].end = self.ranges[pos].end.max(range.end);
+            merge_right = true;
+        }
+
+        match (merge_left, merge_right) {
+            // 左右均合并：删除右侧区间，保留左侧合并后的区间
+            (true, true) => {
+                self.ranges[pos - 1].end = self.ranges[pos].end;
+                self.ranges.remove(pos);
+            }
+            // 仅合并左侧：直接更新区间
+            (true, false) => {}
+            // 仅合并右侧：直接更新区间
+            (false, true) => {}
+            // 无合并：插入新区间
+            (false, false) => {
+                self.ranges.insert(pos, range);
+            }
+        }
+
         Ok(())
     }
 
+    #[inline(never)]
     fn merge_around(&mut self, pos: usize) {
-        let mut start = pos;
-        let mut end = pos;
-
-        // Expand left
-        while start > 0 && self.ranges[start - 1].end >= self.ranges[start].start {
-            start -= 1;
+        let ranges = self.ranges.as_mut_slice();
+        let len = ranges.len();
+        if len <= 1 {
+            return;
         }
 
-        // Expand right
-        while end < self.ranges.len().saturating_sub(1)
-            && self.ranges[end].end >= self.ranges[end + 1].start
-        {
-            end += 1;
+        let mut left = pos;
+        let mut right = pos;
+
+        // 向左合并
+        while likely(left > 0) {
+            let prev = unsafe { ranges.get_unchecked(left - 1) };
+            let current = unsafe { ranges.get_unchecked(left) };
+            if prev.end >= current.start {
+                left -= 1;
+            } else {
+                break;
+            }
         }
 
-        if start < end {
-            let merged_start = self.ranges[start].start;
-            let merged_end = self.ranges[end].end;
-            self.ranges.drain(start..=end);
+        // 向右合并
+        while likely(right < len.saturating_sub(1)) {
+            let current = unsafe { ranges.get_unchecked(right) };
+            let next = unsafe { ranges.get_unchecked(right + 1) };
+            if current.end >= next.start {
+                right += 1;
+            } else {
+                break;
+            }
+        }
+
+        if left < right {
+            // 计算合并后的范围
+            let merged_start = unsafe { ranges.get_unchecked(left).start };
+            let merged_end = unsafe { ranges.get_unchecked(right).end };
+            self.ranges.drain(left..=right);
             self.ranges.insert(
-                start,
+                left,
                 FileRange {
                     start: merged_start,
                     end: merged_end,
@@ -233,46 +282,32 @@ impl FileMultiRange {
         }
     }
 
-    pub fn merge(&mut self) {
-        if self.ranges.is_empty() {
-            return;
-        }
-
-        let mut merged = smallvec![];
-        let mut current = self.ranges[0];
-
-        for &range in &self.ranges[1..] {
-            if range.start <= current.end {
-                current.end = current.end.max(range.end);
-            } else {
-                merged.push(current);
-                current = range;
-            }
-        }
-
-        merged.push(current);
-        self.ranges = merged;
-    }
-
     pub fn intersect(&self, other: &Self) -> Self {
         let mut result = Self::new();
-        let (mut i, mut j) = (0, 0);
+        let (mut a_ptr, mut b_ptr) = (self.ranges.as_ptr(), other.ranges.as_ptr());
+        let (a_end, b_end) = (unsafe { a_ptr.add(self.ranges.len()) }, unsafe {
+            b_ptr.add(other.ranges.len())
+        });
 
-        while i < self.ranges.len() && j < other.ranges.len() {
-            let a = &self.ranges[i];
-            let b = &other.ranges[j];
+        while a_ptr < a_end && b_ptr < b_end {
+            // 直接解引用指针，免去 bound check
+            let a = unsafe { &*a_ptr };
+            let b = unsafe { &*b_ptr };
 
             let start = a.start.max(b.start);
             let end = a.end.min(b.end);
 
-            if start < end {
+            if likely(start < end) {
                 result.ranges.push(FileRange { start, end });
             }
 
-            if a.end <= b.end {
-                i += 1;
-            } else {
-                j += 1;
+            match a.end.cmp(&b.end) {
+                std::cmp::Ordering::Less => a_ptr = unsafe { a_ptr.add(1) },
+                std::cmp::Ordering::Greater => b_ptr = unsafe { b_ptr.add(1) },
+                _ => {
+                    a_ptr = unsafe { a_ptr.add(1) };
+                    b_ptr = unsafe { b_ptr.add(1) };
+                }
             }
         }
 
@@ -282,37 +317,34 @@ impl FileMultiRange {
     pub fn subtract(&self, other: &Self) -> Self {
         let mut result = Self::new();
         let mut other_idx = 0;
+        let other_ranges = other.ranges.as_ptr(); // 改为指针操作
+        let other_len = other.ranges.len();
 
         for &range in &self.ranges {
             let mut current = range;
-
-            while other_idx < other.ranges.len() && current.start < current.end {
-                let sub = &other.ranges[other_idx];
-
-                if sub.end <= current.start {
+            while likely(other_idx < other_len) && likely(current.start < current.end) {
+                // 两个条件通常都成立
+                let sub = unsafe { &*other_ranges.add(other_idx) };
+                if unlikely(sub.end <= current.start) {
+                    // 当前区间在sub之后是特殊情况
                     other_idx += 1;
                     continue;
                 }
-
                 if sub.start >= current.end {
                     break;
                 }
-
                 if current.start < sub.start {
                     result.ranges.push(FileRange {
                         start: current.start,
                         end: sub.start,
                     });
                 }
-
                 current.start = current.start.max(sub.end);
                 if sub.end > current.end {
                     break;
                 }
-
                 other_idx += 1;
             }
-
             if current.start < current.end {
                 result.ranges.push(current);
             }
@@ -339,7 +371,7 @@ impl FileMultiRange {
 
 impl<T> TryFrom<&[T]> for FileMultiRange
 where
-    T: ToRangeBoundPair + Clone,
+    T: ToRangeBoundPair,
 {
     type Error = FileRangeError;
 
@@ -349,7 +381,6 @@ where
             let (start, end) = extract_range_bounds(range)?;
             rgns.add_checked(start, end)?;
         }
-        rgns.merge();
         Ok(rgns)
     }
 }
@@ -373,7 +404,7 @@ fn extract_range_bounds(rgn: &impl ToRangeBoundPair) -> Result<(usize, usize), F
         Unbounded => Err(IndexUnbounded),
     }?;
 
-    if start < end {
+    if likely(start < end) {
         Ok((start, end))
     } else {
         Err(InvalidRange {

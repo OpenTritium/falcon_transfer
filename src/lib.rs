@@ -4,6 +4,7 @@
 #![feature(slice_index_methods)]
 #![feature(slice_pattern)]
 #![feature(slice_as_array)]
+#![feature(likely_unlikely)]
 
 use std::future::pending;
 
