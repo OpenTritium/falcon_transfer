@@ -1,9 +1,5 @@
-use maplit::btreeset;
 use smallvec::SmallVec;
-use std::{
-    collections::BTreeSet,
-    ops::{Bound, Range, RangeBounds, RangeInclusive},
-};
+use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
 use thiserror::Error;
 
 #[macro_export]
@@ -91,8 +87,9 @@ impl Eq for FileRange {}
 
 impl From<FileRange> for FileMultiRange {
     fn from(rgn: FileRange) -> Self {
+        use smallvec::smallvec;
         FileMultiRange {
-            inner: btreeset! {rgn},
+            inner: smallvec![rgn],
         }
     }
 }
@@ -174,83 +171,97 @@ pub type StackAllocatedPefered = SmallVec<[FileRange; 16]>;
 
 #[derive(Debug, Clone)]
 pub struct FileMultiRange {
-    pub inner: BTreeSet<FileRange>,
+    pub inner: StackAllocatedPefered,
 }
 
 impl FileMultiRange {
     pub fn new(rngs: &[impl RangeBounds<usize> + Clone]) -> Self {
-        let rgns = rngs
+        let rgns: StackAllocatedPefered = rngs
             .into_iter()
             .map(|rng| {
                 FileRange::try_from(RangeBoundsWrapper(rng.clone())).expect("Invalid range bounds")
             })
-            .collect::<BTreeSet<FileRange>>();
-        let mut rst = Self { inner: rgns };
-        rst.merge();
-        rst
-    }
-
-    /// 不自动合并
-    pub fn add_without_merge(
-        &mut self,
-        rng: impl RangeBounds<usize>,
-    ) -> Result<(), FileRangeError> {
-        let rgn = rangify!(rng)?;
-        self.inner.insert(rgn);
-        Ok(())
+            .collect();
+        let mut mask = Self { inner: rgns };
+        mask.merge();
+        mask
     }
 
     pub fn add(&mut self, rng: impl RangeBounds<usize>) -> Result<(), FileRangeError> {
-        self.add_without_merge(rng)?;
+        let rgn = rangify!(rng)?;
+        self.inner.push(rgn);
         self.merge();
         Ok(())
     }
 
-    pub fn intersect(&self, other: &Self) -> Self {
-        let mut result = BTreeSet::new();
-        for self_range in &self.inner {
-            for other_range in &other.inner {
-                if let Some(intersection) = self_range.intersect(other_range) {
-                    result.insert(intersection);
+    #[inline]
+    pub fn merge(&mut self) {
+        self.inner.sort_unstable_by_key(|rgn| rgn.start);
+        let mut merged: StackAllocatedPefered = SmallVec::new();
+        for rgn in std::mem::take(&mut self.inner) {
+            if let Some(last) = merged.last_mut() {
+                if rgn.start <= last.end {
+                    last.end = last.end.max(rgn.end);
+                } else {
+                    merged.push(rgn);
                 }
+            } else {
+                merged.push(rgn);
             }
         }
-        let mut rst = Self { inner: result };
-        rst.merge();
-        rst
+        self.inner = merged;
+    }
+
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut rgns = StackAllocatedPefered::new();
+        let (mut i, mut j) = (0, 0);
+
+        while i != self.inner.len() && j != other.inner.len() {
+            let a = &self.inner[i];
+            let b = &other.inner[j];
+            if let Some(intersection) = a.intersect(b) {
+                rgns.push(intersection);
+            }
+            if a.end <= b.end {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        Self { inner: rgns }
     }
 
     pub fn union(&self, other: &Self) -> Self {
         let mut merged = self.inner.clone();
         merged.extend(other.inner.iter().cloned());
-        let mut rst = Self { inner: merged };
-        rst.merge();
-        rst
+        let mut res = Self { inner: merged };
+        res.merge();
+        res
     }
 
     pub fn subtract(&self, other: &Self) -> Self {
         let mut cur_rgns = self.inner.clone();
         for sub in &other.inner {
-            let mut next_rgns = BTreeSet::new();
+            let mut next_rgns = StackAllocatedPefered::new();
             for current in cur_rgns {
                 let mut tmp = current;
                 let left_end = std::cmp::min(sub.start, tmp.end);
                 if let Some(left) = FileRange::try_new(tmp.start, left_end) {
                     if left.start < left.end {
-                        next_rgns.insert(left);
+                        next_rgns.push(left);
                         tmp.start = left_end;
                     }
                 }
                 let right_start = std::cmp::max(sub.end, tmp.start);
                 if let Some(right) = FileRange::try_new(right_start, tmp.end) {
                     if right.start < right.end {
-                        next_rgns.insert(right);
+                        next_rgns.push(right);
                         tmp.end = right_start;
                     }
                 }
                 if tmp.start < tmp.end {
                     if let Some(remaining) = tmp.subtract(sub) {
-                        next_rgns.insert(remaining);
+                        next_rgns.push(remaining);
                     }
                 }
             }
@@ -260,31 +271,12 @@ impl FileMultiRange {
         rst.merge();
         rst
     }
-
-    pub fn merge(&mut self) {
-        let mut merged = BTreeSet::new();
-        let mut current = match self.inner.iter().next().cloned() {
-            Some(rgn) => rgn,
-            None => return,
-        };
-
-        for rgn in self.inner.iter().skip(1) {
-            if current.end >= rgn.start {
-                current.end = current.end.max(rgn.end);
-            } else {
-                merged.insert(current);
-                current = *rgn;
-            }
-        }
-        merged.insert(current);
-        self.inner = merged;
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maplit::btreeset;
+    use smallvec::smallvec_inline;
     use std::ops::Bound;
 
     #[test]
@@ -328,39 +320,48 @@ mod tests {
 
     #[test]
     fn mask_merging() {
-        let mask = FileMultiRange::new(vec![1..3, 4..6, 7..9].as_slice());
+        let mask = FileMultiRange::new(smallvec_inline![1..3, 4..6, 7..9].as_slice());
         assert_eq!(
             mask.inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(1, 3).unwrap(),
                 FileRange::try_new(4, 6).unwrap(),
                 FileRange::try_new(7, 9).unwrap()
-            }
+            ]
         );
 
-        let mask = FileMultiRange::new(vec![1..5, 3..7, 6..9].as_slice());
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 9).unwrap()});
-
-        let mask = FileMultiRange::new(vec![1..10, 2..5, 3..6].as_slice());
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 10).unwrap()});
-
-        let mask = FileMultiRange::new(vec![1..5, 5..8].as_slice());
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 8).unwrap()});
-
-        let mask = FileMultiRange::new(vec![5..8, 1..3, 2..6, 10..12].as_slice());
+        let mask = FileMultiRange::new(smallvec_inline![1..5, 3..7, 6..9].as_slice());
         assert_eq!(
             mask.inner,
-            btreeset! {
+            smallvec_inline![FileRange::try_new(1, 9).unwrap()]
+        );
+
+        let mask = FileMultiRange::new(smallvec_inline![1..10, 2..5, 3..6].as_slice());
+        assert_eq!(
+            mask.inner,
+            smallvec_inline![FileRange::try_new(1, 10).unwrap()]
+        );
+
+        let mask = FileMultiRange::new(smallvec_inline![1..5, 5..8].as_slice());
+        assert_eq!(
+            mask.inner,
+            smallvec_inline![FileRange::try_new(1, 8).unwrap()]
+        );
+
+        let mask = FileMultiRange::new(smallvec_inline![5..8, 1..3, 2..6, 10..12].as_slice());
+        assert_eq!(
+            mask.inner,
+            smallvec_inline![
                 FileRange::try_new(1, 8).unwrap(),
                 FileRange::try_new(10, 12).unwrap()
-            }
+            ]
         );
     }
 
     #[test]
     #[should_panic(expected = "Invalid range bounds")]
     fn invalid_range() {
-        let _ = FileMultiRange::new(vec![100..=50].as_slice());
+        let _ = FileMultiRange::new(smallvec_inline![100..=50].as_slice());
     }
 
     #[test]
@@ -368,29 +369,35 @@ mod tests {
         let rgn = rangify!(5..=5).unwrap();
         assert_eq!(rgn, FileRange::try_new(5, 6).unwrap());
 
-        let mask = FileMultiRange::new(vec![1..=5, 5..=8].as_slice());
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 9).unwrap()});
-
-        let mask = FileMultiRange::new(vec![1..=5, 7..=9].as_slice());
+        let mask = FileMultiRange::new(smallvec_inline![1..=5, 5..=8].as_slice());
         assert_eq!(
             mask.inner,
-            btreeset! {
-                FileRange::try_new(1, 6).unwrap(),
-                FileRange::try_new(7, 10).unwrap()
-            }
+            smallvec_inline![FileRange::try_new(1, 9).unwrap()]
         );
 
-        let mask = FileMultiRange::new(vec![1..=5, 5..=8, 8..=10].as_slice());
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 11).unwrap()});
+        let mask = FileMultiRange::new(smallvec_inline![1..=5, 7..=9].as_slice());
+        assert_eq!(
+            mask.inner,
+            smallvec_inline![
+                FileRange::try_new(1, 6).unwrap(),
+                FileRange::try_new(7, 10).unwrap()
+            ]
+        );
+
+        let mask = FileMultiRange::new(smallvec_inline![1..=5, 5..=8, 8..=10].as_slice());
+        assert_eq!(
+            mask.inner,
+            smallvec_inline![FileRange::try_new(1, 11).unwrap()]
+        );
     }
 
     #[test]
     #[should_panic]
     fn edge_cases() {
-        let mask = FileMultiRange::new(vec![usize::MAX - 1..=usize::MAX].as_slice());
+        let mask = FileMultiRange::new(smallvec_inline![usize::MAX - 1..=usize::MAX].as_slice());
         assert_eq!(
             mask.inner,
-            btreeset! {FileRange::try_new(usize::MAX - 1, usize::MAX).unwrap()}
+            smallvec_inline![FileRange::try_new(usize::MAX - 1, usize::MAX).unwrap()]
         );
     }
 
@@ -423,32 +430,35 @@ mod tests {
         let rg1: RangeInclusive<usize> = rangify!(1..5).unwrap().into();
         let rg2: RangeInclusive<usize> = rangify!(start = 5, end = 8).unwrap().into();
 
-        let mask = FileMultiRange::new(vec![rg1, rg2].as_slice());
+        let mask = FileMultiRange::new(smallvec_inline![rg1, rg2].as_slice());
 
-        assert_eq!(mask.inner, btreeset! {FileRange { start: 1, end: 8 }});
+        assert_eq!(mask.inner, smallvec_inline![FileRange { start: 1, end: 8 }]);
     }
 
     #[test]
     fn push_range() {
-        let mut mask = FileMultiRange::new(vec![3..5, 1..2].as_slice()); // 乱序输入
+        let mut mask = FileMultiRange::new(smallvec_inline![3..5, 1..2].as_slice()); // 乱序输入
         assert_eq!(
             mask.inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(1, 2).unwrap(),
                 FileRange::try_new(3, 5).unwrap()
-            }
+            ]
         );
 
         mask.add(2..4).unwrap();
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 5).unwrap()});
+        assert_eq!(
+            mask.inner,
+            smallvec_inline![FileRange::try_new(1, 5).unwrap()]
+        );
 
         mask.add(6..8).unwrap();
         assert_eq!(
             mask.inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(1, 5).unwrap(),
                 FileRange::try_new(6, 8).unwrap()
-            }
+            ]
         );
     }
 
@@ -532,30 +542,30 @@ mod tests {
         let intersection = a.intersect(&b);
         assert_eq!(
             intersection.inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(3, 5).unwrap(),
                 FileRange::try_new(8, 10).unwrap()
-            }
+            ]
         );
 
         // 测试并集
         let union = a.union(&b);
         assert_eq!(
             union.inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(1, 12).unwrap(),
                 FileRange::try_new(15, 20).unwrap()
-            }
+            ]
         );
 
         // 测试差集（A - B）
         let subtraction = a.subtract(&b);
         assert_eq!(
             subtraction.inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(1, 3).unwrap(),
                 FileRange::try_new(10, 12).unwrap()
-            }
+            ]
         );
 
         // 复杂差集测试
@@ -564,12 +574,12 @@ mod tests {
         let diff = complex_a.subtract(&complex_b);
         assert_eq!(
             diff.inner,
-            btreeset! {
-                 FileRange::try_new(0, 2).unwrap(),
-                 FileRange::try_new(5, 8).unwrap(),
-                 FileRange::try_new(12, 15).unwrap(),
-                 FileRange::try_new(18, 20).unwrap()
-            }
+            smallvec_inline![
+                FileRange::try_new(0, 2).unwrap(),
+                FileRange::try_new(5, 8).unwrap(),
+                FileRange::try_new(12, 15).unwrap(),
+                FileRange::try_new(18, 20).unwrap()
+            ]
         );
 
         // 完全包含测试
@@ -577,18 +587,10 @@ mod tests {
         let full_b = FileMultiRange::new(&[8..12]);
         assert_eq!(
             full_a.subtract(&full_b).inner,
-            btreeset! {
+            smallvec_inline![
                 FileRange::try_new(5, 8).unwrap(),
                 FileRange::try_new(12, 15).unwrap()
-            }
+            ]
         );
-    }
-    #[test]
-    fn edge_merge() {
-        let mut mask = FileMultiRange::new(&[1..5, 5..8]);
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 8).unwrap()});
-
-        mask.add(7..10).unwrap();
-        assert_eq!(mask.inner, btreeset! {FileRange::try_new(1, 10).unwrap()});
     }
 }

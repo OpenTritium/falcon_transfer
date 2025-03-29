@@ -1,11 +1,12 @@
 use super::{FileMultiRange, FileRange, StackAllocatedPefered};
+use crate::rangify;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::FutureExt;
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -67,7 +68,7 @@ impl HotFile {
     }
 
     #[inline]
-    async fn read_file_by_range(&self, itv: FileRange) -> std::io::Result<Bytes> {
+    async fn read_file_by_rangify(&self, itv: FileRange) -> std::io::Result<Bytes> {
         let mut file_guard = self.file.lock().await;
         file_guard.seek(SeekFrom::Start(itv.start as u64)).await?;
         let mut buf = BytesMut::with_capacity(itv.len());
@@ -119,7 +120,7 @@ impl HotFile {
                     }
                     Source::Disk => {
                         data_futures
-                            .push(async move { self.read_file_by_range(*range).await }.boxed());
+                            .push(async move { self.read_file_by_rangify(*range).await }.boxed());
                     }
                 }
             }
@@ -150,11 +151,8 @@ enum Source {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use tempfile::tempdir;
     use xxhash_rust::xxh3::xxh3_64;
-
-    use crate::rangify;
 
     use super::*;
 
