@@ -34,6 +34,7 @@ xxhash-rust = {version= "0.8.15",features=["xxh3"]}
 arrayvec = "0.7.6"
 smallvec = "1.14.0"
 tempfile = "3.19.1"
+maplit = "1.0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }
