@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use falcon_transfer::hot_file::{HotFile, MultiInterval};
-use falcon_transfer::interval;
+use falcon_transfer::hot_file::{FileMultiRange, HotFile};
+use falcon_transfer::rangify;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
@@ -113,7 +113,7 @@ fn read_mixed_bench(c: &mut Criterion) {
         b.iter(|| {
             let hot_file = hot_file.clone();
             let read_size = 4096;
-            let mask = MultiInterval::new(&[interval!(offset..offset + read_size).unwrap()]);
+            let mask = FileMultiRange::new(&[rangify!(offset..offset + read_size).unwrap()]);
             offset = (offset + read_size) % (1024 * 1024 - read_size);
 
             hot_file.read(mask);

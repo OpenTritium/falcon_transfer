@@ -1,5 +1,5 @@
-use super::{Interval, IntervalsStackAllocatedPefered, MultiInterval};
-use crate::interval;
+use super::{FileMultiRange, FileRange, StackAllocatedPefered};
+use crate::rangify;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::FutureExt;
@@ -18,7 +18,7 @@ pub type Offset = usize;
 
 pub struct HotFile {
     file: Mutex<File>,
-    dirty: DashMap<Interval, Bytes>, //更换到 Mutex<Btree>
+    dirty: DashMap<FileRange, Bytes>, //更换到 Mutex<Btree>
 }
 
 impl HotFile {
@@ -37,7 +37,7 @@ impl HotFile {
 
     pub fn write(&self, buf: Bytes, offset: Offset) {
         self.dirty.insert(
-            Interval {
+            FileRange {
                 start: offset,
                 end: offset + buf.len(),
             },
@@ -46,7 +46,7 @@ impl HotFile {
     }
 
     pub async fn sync(&self) -> std::io::Result<()> {
-        let dirty: BTreeMap<Interval, Bytes> = self
+        let dirty: BTreeMap<FileRange, Bytes> = self
             .dirty
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
@@ -55,20 +55,20 @@ impl HotFile {
             return Ok(());
         }
         let mut file_guard = self.file.lock().await;
-        for (interval, data) in dirty {
+        for (rangify, data) in dirty {
             file_guard
-                .seek(SeekFrom::Start(interval.start as u64))
+                .seek(SeekFrom::Start(rangify.start as u64))
                 .await?;
             file_guard.write_all(&data).await?;
             self.dirty
-                .remove_if(&interval, |_, current_data| *current_data == data);
+                .remove_if(&rangify, |_, current_data| *current_data == data);
         }
         file_guard.sync_all().await?;
         Ok(())
     }
 
     #[inline]
-    async fn read_file_by_interval(&self, itv: Interval) -> std::io::Result<Bytes> {
+    async fn read_file_by_rangify(&self, itv: FileRange) -> std::io::Result<Bytes> {
         let mut file_guard = self.file.lock().await;
         file_guard.seek(SeekFrom::Start(itv.start as u64)).await?;
         let mut buf = BytesMut::with_capacity(itv.len());
@@ -76,10 +76,10 @@ impl HotFile {
         Ok(buf.freeze())
     }
 
-    pub async fn read(&self, mask: MultiInterval) -> std::io::Result<Vec<Bytes>> {
+    pub async fn read(&self, mask: FileMultiRange) -> std::io::Result<Vec<Bytes>> {
         let mut result = Vec::new();
-        for itv in mask.intervals {
-            let dirty_blocks: BTreeMap<Interval, Bytes> = self
+        for itv in mask.inner {
+            let dirty_blocks: BTreeMap<FileRange, Bytes> = self
                 .dirty
                 .iter()
                 .filter_map(|entry| {
@@ -92,12 +92,12 @@ impl HotFile {
                     })
                 })
                 .collect();
-            let full_mask: MultiInterval = itv.into();
-            let dirty_mask = MultiInterval::new(
+            let full_mask: FileMultiRange = itv.into();
+            let dirty_mask = FileMultiRange::new(
                 dirty_blocks
                     .keys()
                     .cloned()
-                    .collect::<IntervalsStackAllocatedPefered>()
+                    .collect::<StackAllocatedPefered>()
                     .as_slice(),
             );
             let disk_mask = full_mask.subtract(&dirty_mask);
@@ -107,7 +107,7 @@ impl HotFile {
                 .collect::<BTreeMap<_, _>>();
             segments.extend(
                 disk_mask
-                    .intervals
+                    .inner
                     .iter()
                     .map(|itv| (*itv, Source::Disk))
                     .collect::<BTreeMap<_, _>>(),
@@ -120,7 +120,7 @@ impl HotFile {
                     }
                     Source::Disk => {
                         data_futures
-                            .push(async move { self.read_file_by_interval(*range).await }.boxed());
+                            .push(async move { self.read_file_by_rangify(*range).await }.boxed());
                     }
                 }
             }
@@ -133,7 +133,7 @@ impl HotFile {
         Ok(result)
     }
 
-    async fn compute_hash(&self, mask: MultiInterval) -> std::io::Result<u64> {
+    async fn compute_hash(&self, mask: FileMultiRange) -> std::io::Result<u64> {
         let chunks = self.read(mask).await?;
         let mut hasher = Xxh3::new();
         for chunk in chunks {
@@ -174,7 +174,7 @@ mod tests {
         tokio::fs::write(&path, b"abcdefghij").await.unwrap();
 
         let hot_file = HotFile::open(&path).await.unwrap();
-        let mask = MultiInterval::new(vec![interval!(0..10).unwrap()].as_slice());
+        let mask = FileMultiRange::new(vec![rangify!(0..10).unwrap()].as_slice());
         let result = hot_file.read(mask).await.unwrap();
 
         assert_eq!(concat_bytes(result), Bytes::from("abcdefghij"));
@@ -187,7 +187,7 @@ mod tests {
 
         // 写入脏数据覆盖整个区间
         hot_file.write(Bytes::from("12345"), 0);
-        let mask = MultiInterval::new(vec![interval!(0..5).unwrap()].as_slice());
+        let mask = FileMultiRange::new(vec![rangify!(0..5).unwrap()].as_slice());
         let result = hot_file.read(mask).await.unwrap();
 
         assert_eq!(concat_bytes(result), Bytes::from("12345"));
@@ -206,7 +206,7 @@ mod tests {
         hot_file.write(Bytes::from("123"), 2); // 覆盖 2-5
         hot_file.write(Bytes::from("45"), 7); // 覆盖 7-9
 
-        let mask = MultiInterval::new(vec![interval!(0..10).unwrap()].as_slice());
+        let mask = FileMultiRange::new(vec![rangify!(0..10).unwrap()].as_slice());
         let result = hot_file.read(mask).await.unwrap();
 
         // 预期结果: ab(disk) + 123(dirty) + fg(disk) + 45(dirty) + j(disk)
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_multiple_intervals() {
+    async fn read_multiple_rangifys() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("test4");
 
@@ -228,10 +228,10 @@ mod tests {
         hot_file.write(Bytes::from("123"), 3); // 3-6
         hot_file.write(Bytes::from("45"), 8); // 8-10
 
-        let mask = MultiInterval::new(
+        let mask = FileMultiRange::new(
             vec![
-                interval!(0..4).unwrap(),  // 0-4 (0-3 clean + 3-4 dirty)
-                interval!(6..10).unwrap(), // 6-8 clean + 8-10 dirty
+                rangify!(0..4).unwrap(),  // 0-4 (0-3 clean + 3-4 dirty)
+                rangify!(6..10).unwrap(), // 6-8 clean + 8-10 dirty
             ]
             .as_slice(),
         );
@@ -250,7 +250,7 @@ mod tests {
         tokio::fs::write(&path, original_data).await.unwrap();
 
         let hot_file = Arc::new(HotFile::open(&path).await.unwrap());
-        let mask = MultiInterval::new(vec![interval!(0..26).unwrap()].as_slice());
+        let mask = FileMultiRange::new(vec![rangify!(0..26).unwrap()].as_slice());
 
         let computed = hot_file.compute_hash(mask).await.unwrap();
         let expected = xxh3_64(original_data);
@@ -268,7 +268,7 @@ mod tests {
 
         // 写入覆盖全区的脏数据
         hot_file.write(Bytes::from("new_data"), 0);
-        let mask = MultiInterval::new(vec![interval!(0..8).unwrap()].as_slice());
+        let mask = FileMultiRange::new(vec![rangify!(0..8).unwrap()].as_slice());
 
         let computed = hot_file.compute_hash(mask).await.unwrap();
         let expected = xxh3_64(b"new_data");
@@ -288,7 +288,7 @@ mod tests {
         hot_file.write(Bytes::from("HELLO"), 0); // 覆盖 0..5
         hot_file.write(Bytes::from("D"), 10); // 覆盖 10
 
-        let mask = MultiInterval::new(vec![interval!(0..11).unwrap()].as_slice());
+        let mask = FileMultiRange::new(vec![rangify!(0..11).unwrap()].as_slice());
         let computed = hot_file.compute_hash(mask).await.unwrap();
 
         let expected = xxh3_64(b"HELLO_worlD");
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sparse_intervals() {
+    async fn test_sparse_rangifys() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test4");
 
@@ -309,10 +309,10 @@ mod tests {
         hot_file.write(Bytes::from("123"), 3); // 3-6
         hot_file.write(Bytes::from("45"), 8); // 8-10
 
-        let mask = MultiInterval::new(
+        let mask = FileMultiRange::new(
             vec![
-                interval!(0..4).unwrap(),  // 0-3 clean + 3-4 dirty
-                interval!(6..10).unwrap(), // 6-8 clean + 8-10 dirty
+                rangify!(0..4).unwrap(),  // 0-3 clean + 3-4 dirty
+                rangify!(6..10).unwrap(), // 6-8 clean + 8-10 dirty
             ]
             .as_slice(),
         );
