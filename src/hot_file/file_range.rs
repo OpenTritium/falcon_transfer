@@ -3,11 +3,10 @@ use std::{
     cmp::Ordering,
     hint::{likely, unlikely},
     ops::{Bound, Range, RangeInclusive},
-    slice::SliceIndex,
 };
 use thiserror::Error;
 
-const STACK_BUFFERED: usize = 8;
+pub const STACK_BUFFERED: usize = 8;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum FileRangeError {
@@ -215,7 +214,7 @@ impl ToRangeBoundPair for (usize, usize) {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileMultiRange {
-    inner: SmallVec<[FileRange; STACK_BUFFERED]>,
+    pub inner: SmallVec<[FileRange; STACK_BUFFERED]>,
 }
 
 impl FileMultiRange {

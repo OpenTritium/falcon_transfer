@@ -1,10 +1,11 @@
 use super::{FileMultiRange, FileRange, StackAllocatedPefered};
-use crate::rangify;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::FutureExt;
 use std::collections::BTreeMap;
 use std::hash::Hasher;
+use std::hint::unlikely;
+use std::io::Result as IoResult;
 use std::io::SeekFrom;
 use std::{path::Path, sync::Arc};
 use tokio::fs::{File, OpenOptions};
@@ -17,12 +18,13 @@ pub type Offset = usize;
 // 来个接口用于抽象文件和缓存
 
 pub struct HotFile {
-    file: Mutex<File>,
-    dirty: DashMap<FileRange, Bytes>, //更换到 Mutex<Btree>
+    disk: Mutex<File>,
+    dirty: Mutex<BTreeMap<FileRange, Bytes>>,
 }
 
 impl HotFile {
-    pub async fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+    // todo 优化初始化setlen
+    pub async fn open<P: AsRef<Path>>(path: P) -> IoResult<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -30,13 +32,13 @@ impl HotFile {
             .open(path)
             .await?;
         Ok(Self {
-            file: Mutex::new(file),
-            dirty: DashMap::new(),
+            disk: Mutex::new(file),
+            dirty: Default::default(),
         })
     }
 
-    pub fn write(&self, buf: Bytes, offset: Offset) {
-        self.dirty.insert(
+    pub async fn write(&self, buf: Bytes, offset: Offset) {
+        self.dirty.lock().await.insert(
             FileRange {
                 start: offset,
                 end: offset + buf.len(),
@@ -45,38 +47,31 @@ impl HotFile {
         );
     }
 
-    pub async fn sync(&self) -> std::io::Result<()> {
-        let dirty: BTreeMap<FileRange, Bytes> = self
-            .dirty
-            .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
-            .collect();
-        if dirty.is_empty() {
+    pub async fn sync(&self) -> IoResult<()> {
+        let mut dirty_guard = self.dirty.lock().await;
+        if unlikely(dirty_guard.is_empty()) {
             return Ok(());
         }
-        let mut file_guard = self.file.lock().await;
-        for (rangify, data) in dirty {
-            file_guard
-                .seek(SeekFrom::Start(rangify.start as u64))
-                .await?;
-            file_guard.write_all(&data).await?;
-            self.dirty
-                .remove_if(&rangify, |_, current_data| *current_data == data);
+        let mut file_guard = self.disk.lock().await;
+        let tmp = std::mem::take(&mut *dirty_guard);
+        for (rgn, buf) in tmp.into_iter() {
+            file_guard.seek(SeekFrom::Start(rgn.start as u64)).await?;
+            file_guard.write_all(&buf).await?;
         }
         file_guard.sync_all().await?;
         Ok(())
     }
 
     #[inline]
-    async fn read_file_by_rangify(&self, itv: FileRange) -> std::io::Result<Bytes> {
-        let mut file_guard = self.file.lock().await;
+    async fn read_file_by_rangify(&self, itv: FileRange) -> IoResult<Bytes> {
+        let mut file_guard = self.disk.lock().await;
         file_guard.seek(SeekFrom::Start(itv.start as u64)).await?;
         let mut buf = BytesMut::with_capacity(itv.len());
         file_guard.read_buf(&mut buf).await?;
         Ok(buf.freeze())
     }
 
-    pub async fn read(&self, mask: FileMultiRange) -> std::io::Result<Vec<Bytes>> {
+    pub async fn read(&self, mask: FileMultiRange) -> IoResult<Vec<Bytes>> {
         let mut result = Vec::new();
         for itv in mask.inner {
             let dirty_blocks: BTreeMap<FileRange, Bytes> = self
@@ -133,7 +128,7 @@ impl HotFile {
         Ok(result)
     }
 
-    async fn compute_hash(&self, mask: FileMultiRange) -> std::io::Result<u64> {
+    async fn compute_hash(&self, mask: FileMultiRange) -> IoResult<u64> {
         let chunks = self.read(mask).await?;
         let mut hasher = Xxh3::new();
         for chunk in chunks {
