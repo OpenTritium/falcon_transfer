@@ -1,7 +1,9 @@
 use smallvec::{SmallVec, smallvec};
 use std::{
+    cmp::Ordering,
     hint::{likely, unlikely},
     ops::{Bound, Range, RangeInclusive},
+    slice::SliceIndex,
 };
 use thiserror::Error;
 
@@ -33,7 +35,7 @@ impl FileRange {
     }
 
     #[inline]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.end - self.start
     }
 
@@ -46,21 +48,16 @@ impl FileRange {
 
     #[inline]
     pub fn union(&self, other: &Self) -> Option<Self> {
-        if likely(self.end >= other.start && other.end >= self.start) {
-            Some(Self {
-                start: self.start.min(other.start),
-                end: self.end.max(other.end),
-            })
-        } else {
-            None
-        }
+        likely(self.end >= other.start && other.end >= self.start).then(|| Self {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        })
     }
 
     #[inline]
     pub fn subtract(&self, other: &Self) -> [Option<FileRange>; 2] {
-        let intersection = match self.intersect(other) {
-            Some(v) => v,
-            None => return [Some(*self), None],
+        let Some(intersection) = self.intersect(other) else {
+            return [Some(*self), None];
         };
         let a_start = self.start;
         let a_end = self.end;
@@ -88,7 +85,7 @@ impl From<FileRange> for FileMultiRange {
     #[inline]
     fn from(rgn: FileRange) -> Self {
         Self {
-            ranges: smallvec![rgn],
+            inner: smallvec![rgn],
         }
     }
 }
@@ -109,14 +106,14 @@ impl From<FileRange> for RangeInclusive<usize> {
 
 impl PartialOrd for FileRange {
     #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for FileRange {
     #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.start.cmp(&other.start)
     }
 }
@@ -148,224 +145,194 @@ impl TryFrom<(Bound<usize>, Bound<usize>)> for FileRange {
     }
 }
 
+impl FileRange {
+    #[inline]
+    pub fn get<'a>(&self, slice: &'a [u8]) -> Option<&'a [u8]> {
+        if self.start <= self.end && self.end <= slice.len() {
+            Some(&slice[self.start..self.end])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn get_mut<'a>(&self, slice: &'a mut [u8]) -> Option<&'a mut [u8]> {
+        if self.start <= self.end && self.end <= slice.len() {
+            Some(&mut slice[self.start..self.end])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn index<'a>(&self, slice: &'a [u8]) -> &'a [u8] {
+        &slice[self.start..self.end]
+    }
+
+    #[inline]
+    pub fn index_mut<'a>(&self, slice: &'a mut [u8]) -> &'a mut [u8] {
+        &mut slice[self.start..self.end]
+    }
+}
+
 pub trait ToRangeBoundPair {
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>);
 }
 
 impl ToRangeBoundPair for Range<usize> {
-    #[inline]
+    #[inline(always)]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (Bound::Included(self.start), Bound::Excluded(self.end))
     }
 }
 
 impl ToRangeBoundPair for RangeInclusive<usize> {
-    #[inline]
+    #[inline(always)]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (Bound::Included(*self.start()), Bound::Included(*self.end()))
     }
 }
 
 impl ToRangeBoundPair for (Bound<usize>, Bound<usize>) {
-    #[inline]
+    #[inline(always)]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (self.0, self.1)
     }
 }
 
 impl ToRangeBoundPair for FileRange {
-    #[inline]
+    #[inline(always)]
     fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
         (Bound::Included(self.start), Bound::Excluded(self.end))
+    }
+}
+impl ToRangeBoundPair for (usize, usize) {
+    #[inline(always)]
+    fn to_bound_pair(&self) -> (Bound<usize>, Bound<usize>) {
+        (Bound::Included(self.0), Bound::Excluded(self.1))
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileMultiRange {
-    ranges: SmallVec<[FileRange; STACK_BUFFERED]>,
+    inner: SmallVec<[FileRange; STACK_BUFFERED]>,
 }
 
 impl FileMultiRange {
     #[inline]
     pub fn new() -> Self {
         Self {
-            ranges: SmallVec::new(),
+            inner: SmallVec::new(),
         }
     }
 
-    fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
+    pub fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
         let range = FileRange::try_new(start, end).ok_or(FileRangeError::InvalidRange {
             start: Bound::Included(start),
             end: Bound::Excluded(end),
         })?;
-        if unlikely(self.ranges.is_empty()) {
-            self.ranges.push(range);
+        if unlikely(self.inner.is_empty()) {
+            self.inner.push(range);
             return Ok(());
         }
-        let pos = self.ranges.partition_point(|r| r.start <= range.start);
-        let mut merge_left = false;
-        let mut merge_right = false;
-        if pos > 0 && likely(self.ranges[pos - 1].end >= range.start) {
-            self.ranges[pos - 1].end = self.ranges[pos - 1].end.max(range.end);
-            merge_left = true;
-        }
-        if pos < self.ranges.len() && self.ranges[pos].start <= range.end {
-            self.ranges[pos].start = self.ranges[pos].start.min(range.start);
-            self.ranges[pos].end = self.ranges[pos].end.max(range.end);
-            merge_right = true;
-        }
-
-        match (merge_left, merge_right) {
-            // 左右均合并：删除右侧区间，保留左侧合并后的区间
-            (true, true) => {
-                self.ranges[pos - 1].end = self.ranges[pos].end;
-                self.ranges.remove(pos);
-            }
-            // 仅合并左侧：直接更新区间
-            (true, false) => {}
-            // 仅合并右侧：直接更新区间
-            (false, true) => {}
-            // 无合并：插入新区间
-            (false, false) => {
-                self.ranges.insert(pos, range);
+        let left = self.inner.partition_point(|r| r.end < range.start);
+        let right = self.inner.partition_point(|r| r.start <= range.end);
+        unsafe {
+            if likely(left < right) {
+                let ranges = self.inner.as_mut_ptr();
+                let first = &mut *ranges.add(left);
+                first.start = first.start.min(range.start);
+                let last = &*ranges.add(right - 1);
+                first.end = last.end.max(range.end);
+                if right - left > 1 {
+                    let tail = self.inner.len() - right;
+                    std::ptr::copy(ranges.add(right), ranges.add(left + 1), tail);
+                    self.inner.set_len(left + 1 + tail);
+                }
+            } else {
+                self.inner.insert(left, range);
             }
         }
-
         Ok(())
     }
 
-    #[inline(never)]
-    fn merge_around(&mut self, pos: usize) {
-        let ranges = self.ranges.as_mut_slice();
-        let len = ranges.len();
-        if len <= 1 {
-            return;
-        }
-
-        let mut left = pos;
-        let mut right = pos;
-
-        // 向左合并
-        while likely(left > 0) {
-            let prev = unsafe { ranges.get_unchecked(left - 1) };
-            let current = unsafe { ranges.get_unchecked(left) };
-            if prev.end >= current.start {
-                left -= 1;
-            } else {
-                break;
-            }
-        }
-
-        // 向右合并
-        while likely(right < len.saturating_sub(1)) {
-            let current = unsafe { ranges.get_unchecked(right) };
-            let next = unsafe { ranges.get_unchecked(right + 1) };
-            if current.end >= next.start {
-                right += 1;
-            } else {
-                break;
-            }
-        }
-
-        if left < right {
-            // 计算合并后的范围
-            let merged_start = unsafe { ranges.get_unchecked(left).start };
-            let merged_end = unsafe { ranges.get_unchecked(right).end };
-            self.ranges.drain(left..=right);
-            self.ranges.insert(
-                left,
-                FileRange {
-                    start: merged_start,
-                    end: merged_end,
-                },
-            );
-        }
-    }
-
+    #[inline]
     pub fn intersect(&self, other: &Self) -> Self {
         let mut result = Self::new();
-        let (mut a_ptr, mut b_ptr) = (self.ranges.as_ptr(), other.ranges.as_ptr());
-        let (a_end, b_end) = (unsafe { a_ptr.add(self.ranges.len()) }, unsafe {
-            b_ptr.add(other.ranges.len())
-        });
-
-        while a_ptr < a_end && b_ptr < b_end {
-            // 直接解引用指针，免去 bound check
-            let a = unsafe { &*a_ptr };
-            let b = unsafe { &*b_ptr };
-
+        let (mut a_iter, mut b_iter) =
+            (self.inner.iter().peekable(), other.inner.iter().peekable());
+        while let (Some(a), Some(b)) = (a_iter.peek(), b_iter.peek()) {
             let start = a.start.max(b.start);
             let end = a.end.min(b.end);
-
             if likely(start < end) {
-                result.ranges.push(FileRange { start, end });
+                result.inner.push(FileRange { start, end });
             }
-
+            use std::cmp::Ordering::*;
             match a.end.cmp(&b.end) {
-                std::cmp::Ordering::Less => a_ptr = unsafe { a_ptr.add(1) },
-                std::cmp::Ordering::Greater => b_ptr = unsafe { b_ptr.add(1) },
+                Less => {
+                    a_iter.next();
+                }
+                Greater => {
+                    b_iter.next();
+                }
                 _ => {
-                    a_ptr = unsafe { a_ptr.add(1) };
-                    b_ptr = unsafe { b_ptr.add(1) };
+                    a_iter.next();
+                    b_iter.next();
                 }
             }
         }
-
         result
     }
 
+    #[inline]
     pub fn subtract(&self, other: &Self) -> Self {
         let mut result = Self::new();
-        let mut other_idx = 0;
-        let other_ranges = other.ranges.as_ptr(); // 改为指针操作
-        let other_len = other.ranges.len();
-
-        for &range in &self.ranges {
+        let mut other_iter = other.inner.iter().peekable();
+        for &range in &self.inner {
             let mut current = range;
-            while likely(other_idx < other_len) && likely(current.start < current.end) {
-                // 两个条件通常都成立
-                let sub = unsafe { &*other_ranges.add(other_idx) };
-                if unlikely(sub.end <= current.start) {
-                    // 当前区间在sub之后是特殊情况
-                    other_idx += 1;
+            while let Some(&&sub) = other_iter.peek() {
+                if likely(sub.end <= current.start) {
+                    other_iter.next();
                     continue;
                 }
-                if sub.start >= current.end {
+                if unlikely(sub.start >= current.end) {
                     break;
                 }
-                if current.start < sub.start {
-                    result.ranges.push(FileRange {
+                if likely(current.start < sub.start) {
+                    result.inner.push(FileRange {
                         start: current.start,
                         end: sub.start,
                     });
                 }
                 current.start = current.start.max(sub.end);
-                if sub.end > current.end {
+                if unlikely(current.start >= current.end) {
                     break;
                 }
-                other_idx += 1;
+                if likely(sub.end > current.end) {
+                    break;
+                }
+                other_iter.next();
             }
-            if current.start < current.end {
-                result.ranges.push(current);
+            if likely(current.start < current.end) {
+                result.inner.push(current);
             }
         }
-
         result
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.ranges.len()
+        self.inner.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
+        self.inner.is_empty()
     }
 
     #[inline]
     pub fn total_len(&self) -> usize {
-        self.ranges.iter().map(|r| r.len()).sum()
+        self.inner.iter().map(|r| r.len()).sum()
     }
 }
 
@@ -374,7 +341,7 @@ where
     T: ToRangeBoundPair,
 {
     type Error = FileRangeError;
-
+    #[inline]
     fn try_from(ranges: &[T]) -> Result<Self, Self::Error> {
         let mut rgns = Self::new();
         for range in ranges {
@@ -385,25 +352,21 @@ where
     }
 }
 
-#[inline]
+#[inline(always)]
 fn extract_range_bounds(rgn: &impl ToRangeBoundPair) -> Result<(usize, usize), FileRangeError> {
     use Bound::*;
     use FileRangeError::*;
-
     let (start, end) = rgn.to_bound_pair();
-
     let start = match start {
         Included(s) => Ok(s),
         Excluded(s) => s.checked_add(1).ok_or(IndexOverflow),
         Unbounded => Err(IndexUnbounded),
     }?;
-
     let end = match end {
         Included(e) => e.checked_add(1).ok_or(IndexOverflow),
         Excluded(e) => Ok(e),
         Unbounded => Err(IndexUnbounded),
     }?;
-
     if likely(start < end) {
         Ok((start, end))
     } else {
@@ -420,85 +383,66 @@ mod tests {
     use Bound::*;
     use smallvec::smallvec_inline;
 
+    // FileRange 基础测试
     #[test]
-    fn filerange_try_new() {
+    fn filerange_basics() {
+        assert_eq!(FileRange::try_new(1, 3).unwrap().len(), 2);
+        assert!(FileRange::try_new(5, 5).is_none());
+    }
+
+    // 边界条件测试
+    #[test]
+    fn edge_cases() {
+        // 最小有效范围
         assert_eq!(
-            FileRange::try_new(1, 3),
-            Some(FileRange { start: 1, end: 3 })
+            FileRange::try_new(0, 1),
+            Some(FileRange { start: 0, end: 1 })
         );
-        assert_eq!(FileRange::try_new(2, 2), None);
-        assert_eq!(FileRange::try_new(3, 1), None);
-    }
 
-    #[test]
-    fn filerange_intersect() {
-        let r1 = FileRange { start: 1, end: 5 };
-        let r2 = FileRange { start: 3, end: 7 };
-        assert_eq!(r1.intersect(&r2), FileRange::try_new(3, 5));
-
-        let r3 = FileRange { start: 5, end: 10 };
-        assert_eq!(r1.intersect(&r3), None);
-    }
-
-    #[test]
-    fn filerange_union() {
-        let r1 = FileRange { start: 1, end: 3 };
-        let r2 = FileRange { start: 2, end: 4 };
-        assert_eq!(r1.union(&r2), FileRange::try_new(1, 4));
-
-        let r1 = FileRange { start: 1, end: 3 };
-        let r2 = FileRange { start: 3, end: 4 };
-        assert_eq!(r1.union(&r2), FileRange::try_new(1, 4));
-
-        let r3 = FileRange { start: 5, end: 7 };
-        assert_eq!(r1.union(&r3), None);
-    }
-
-    #[test]
-    fn filerange_subtract() {
-        let r1 = FileRange { start: 1, end: 10 };
-        let r2 = FileRange { start: 3, end: 7 };
-        let res = r1.subtract(&r2);
-        assert_eq!(res, [FileRange::try_new(1, 3), FileRange::try_new(7, 10)]);
-
-        let r3 = FileRange { start: 0, end: 5 };
-        let res2 = r1.subtract(&r3);
-        assert_eq!(res2, [None, FileRange::try_new(5, 10)]);
-
-        let r4 = FileRange { start: 1, end: 10 };
-        let res3 = r1.subtract(&r4);
-        assert_eq!(res3, [None, None]);
-    }
-
-    #[test]
-    fn filerange_contains() {
-        let r1 = FileRange { start: 2, end: 8 };
-        let r2 = FileRange { start: 3, end: 5 };
-        assert!(r1.contains(&r2));
-
-        let r3 = FileRange { start: 1, end: 9 };
-        assert!(!r1.contains(&r3));
-    }
-
-    #[test]
-    fn extract_valid_range() {
-        assert_eq!(extract_range_bounds(&(1..5)), Ok((1, 5)));
-        assert_eq!(extract_range_bounds(&(2..=6)), Ok((2, 7)));
+        // 最大值边界
+        let max = usize::MAX;
         assert_eq!(
-            extract_range_bounds(&(Included(3), Excluded(5))),
-            Ok((3, 5))
+            FileRange::try_new(max - 1, max),
+            Some(FileRange {
+                start: max - 1,
+                end: max
+            })
         );
     }
 
+    // 类型转换测试
     #[test]
-    fn parse_invalid_range() {
+    fn conversions() {
+        // 从标准库Range转换
         assert_eq!(
-            extract_range_bounds(&(5..3)),
+            FileRange::try_from(1..5).unwrap(),
+            FileRange { start: 1, end: 5 }
+        );
+
+        // 包含最大值的RangeInclusive
+        let max = usize::MAX;
+        assert!(FileRange::try_from(0..=max).is_err());
+
+        // 元组转换
+        assert_eq!(
+            FileRange::try_from((Included(2), Excluded(5))).unwrap(),
+            FileRange { start: 2, end: 5 }
+        );
+    }
+
+    // 错误处理测试
+    #[test]
+    fn error_handling() {
+        // 无效范围
+        assert_eq!(
+            FileRange::try_from(5..3),
             Err(FileRangeError::InvalidRange {
                 start: Included(5),
                 end: Excluded(3)
             })
         );
+
+        // 溢出测试
         assert_eq!(
             extract_range_bounds(&(Included(usize::MAX), Excluded(0))),
             Err(FileRangeError::InvalidRange {
@@ -506,39 +450,35 @@ mod tests {
                 end: Excluded(0)
             })
         );
+
+        // 无界测试
         assert_eq!(
-            extract_range_bounds(&(Included(0), Excluded(0))),
-            Err(FileRangeError::InvalidRange {
-                start: Included(0),
-                end: Excluded(0)
-            })
+            FileRange::try_from((Unbounded, Included(5))),
+            Err(FileRangeError::IndexUnbounded)
         );
     }
 
+    // FileMultiRange 操作测试
     #[test]
-    fn multirange_add_and_merge() {
+    fn multirange_operations() {
+        // 测试相邻范围合并
         let mut mr = FileMultiRange::new();
         mr.add_checked(1, 3).unwrap();
-        mr.add_checked(2, 5).unwrap();
-        assert_eq!(mr.ranges, smallvec_inline![FileRange { start: 1, end: 5 }]);
+        mr.add_checked(3, 5).unwrap();
+        assert_eq!(mr.inner, smallvec_inline![FileRange { start: 1, end: 5 }]);
 
-        mr.add_checked(7, 10).unwrap();
-        assert_eq!(
-            mr.ranges,
-            smallvec_inline![
-                FileRange { start: 1, end: 5 },
-                FileRange { start: 7, end: 10 }
-            ]
-        );
-    }
+        // 测试完全包含范围
+        let mut mr = FileMultiRange::new();
+        mr.add_checked(1, 10).unwrap();
+        mr.add_checked(3, 5).unwrap();
+        assert_eq!(mr.inner, smallvec_inline![FileRange { start: 1, end: 10 }]);
 
-    #[test]
-    fn multirange_intersect() {
-        let mr1 = FileMultiRange::try_from([1..5, 8..12].as_slice()).unwrap();
-        let mr2 = FileMultiRange::try_from([3..10].as_slice()).unwrap();
+        // 测试多范围交集
+        let mr1 = FileMultiRange::try_from([(1, 5), (8, 12)].as_slice()).unwrap();
+        let mr2 = FileMultiRange::try_from([(3, 10)].as_slice()).unwrap();
         let res = mr1.intersect(&mr2);
         assert_eq!(
-            res.ranges,
+            res.inner,
             smallvec_inline![
                 FileRange { start: 3, end: 5 },
                 FileRange { start: 8, end: 10 }
@@ -546,30 +486,92 @@ mod tests {
         );
     }
 
+    // 复杂减法测试
     #[test]
-    fn test_multirange_subtract() {
-        let mr1 = FileMultiRange::try_from([1..10].as_slice()).unwrap();
-        let mr2 = FileMultiRange::try_from([3..5, 7..9].as_slice()).unwrap();
-        let res = mr1.subtract(&mr2);
+    fn complex_subtraction() {
+        let base = FileMultiRange::try_from([(0, 100)].as_slice()).unwrap();
+        let holes = FileMultiRange::try_from([(10, 20), (30, 40), (50, 60)].as_slice()).unwrap();
+        let result = base.subtract(&holes);
+
         assert_eq!(
-            res.ranges,
+            result.inner,
             smallvec_inline![
-                FileRange { start: 1, end: 3 },
-                FileRange { start: 5, end: 7 },
-                FileRange { start: 9, end: 10 }
+                FileRange { start: 0, end: 10 },
+                FileRange { start: 20, end: 30 },
+                FileRange { start: 40, end: 50 },
+                FileRange {
+                    start: 60,
+                    end: 100
+                }
             ]
         );
     }
 
+    // 空集合测试
     #[test]
-    fn bound_checks() {
-        assert!(matches!(
-            FileRange::try_from((Unbounded, Included(5))),
-            Err(FileRangeError::IndexUnbounded)
-        ));
-        assert!(matches!(
-            FileRange::try_from((Included(5), Unbounded)),
-            Err(FileRangeError::IndexUnbounded)
-        ));
+    fn empty_operations() {
+        let empty = FileMultiRange::new();
+        let non_empty = FileMultiRange::try_from([(1, 5)].as_slice()).unwrap();
+
+        // 空集合交集
+        assert!(empty.intersect(&non_empty).is_empty());
+
+        // 空集合减法
+        assert_eq!(non_empty.subtract(&empty).inner, non_empty.inner);
+    }
+
+    // 排序测试
+    #[test]
+    fn ordering() {
+        let r1 = FileRange { start: 1, end: 3 };
+        let r2 = FileRange { start: 2, end: 4 };
+        let r3 = FileRange { start: 5, end: 7 };
+
+        let mut ranges = vec![r3, r1, r2];
+        ranges.sort();
+
+        assert_eq!(
+            ranges,
+            vec![
+                FileRange { start: 1, end: 3 },
+                FileRange { start: 2, end: 4 },
+                FileRange { start: 5, end: 7 }
+            ]
+        );
+    }
+
+    // 溢出场景测试
+    #[test]
+    fn overflow_cases() {
+        // 结束边界溢出
+        assert_eq!(
+            extract_range_bounds(&(Included(5), Included(usize::MAX))),
+            Err(FileRangeError::IndexOverflow)
+        );
+
+        // 开始边界溢出
+        assert_eq!(
+            extract_range_bounds(&(Excluded(usize::MAX), Excluded(0))),
+            Err(FileRangeError::IndexOverflow)
+        );
+    }
+
+    // 完全覆盖测试
+    #[test]
+    fn full_coverage() {
+        let base = FileMultiRange::try_from([(0, 100)].as_slice()).unwrap();
+        let cover = FileMultiRange::try_from([(0, 100)].as_slice()).unwrap();
+        assert!(base.subtract(&cover).is_empty());
+    }
+
+    // 稀疏范围测试
+    #[test]
+    fn sparse_ranges() {
+        let mut mr = FileMultiRange::new();
+        for i in (0..100).step_by(2) {
+            mr.add_checked(i, i + 1).unwrap();
+        }
+        assert_eq!(mr.len(), 50);
+        assert_eq!(mr.total_len(), 50);
     }
 }

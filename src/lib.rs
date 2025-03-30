@@ -5,8 +5,7 @@
 #![feature(slice_pattern)]
 #![feature(slice_as_array)]
 #![feature(likely_unlikely)]
-
-use std::future::pending;
+#![feature(portable_simd)]
 
 pub mod env;
 pub mod hot_file;
