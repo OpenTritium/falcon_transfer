@@ -1,7 +1,7 @@
 mod assigned;
 mod bond;
 mod link_state;
-mod link_state_table;
+mod table;
 mod resume;
 mod flag;
 

@@ -3,6 +3,7 @@ use crate::utils::EndPoint;
 use indexmap::{IndexSet, indexset};
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
 pub struct Bond {
     pub links: IndexSet<Arc<LinkState>>,
     flag: BondStateFlag, // 该状态描述bond状态而非link状态

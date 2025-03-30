@@ -1,4 +1,5 @@
 bitflags::bitflags! {
+    #[derive(Debug,Clone)]
     pub struct BondStateFlag:u8 {
         const DISCOVED = 0; // 全0 表示仅仅才发现
         const HELLO = 1;

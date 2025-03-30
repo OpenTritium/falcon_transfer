@@ -27,7 +27,7 @@ impl LinkStateTable {
         }
     }
     // 仅仅在不存在时才插入
-    pub fn add_new_link(&self, uid: Uid, local: EndPoint, remote: EndPoint) {
+    pub fn update(&self, uid: Uid, local: EndPoint, remote: EndPoint) {
         self.links
             .entry(uid)
             .and_modify(|bond| {
@@ -39,11 +39,7 @@ impl LinkStateTable {
     // todo 重写
     /// 如果返回的链路不能用，那就调用solution，然后再重新申请一条
     pub fn assign(&self, uid: &Uid) -> Result<AssignedLink, LinkError> {
-        let bond = match self.links.get_mut(uid) {
-            Some(bond) => bond,
-            None => return Err(LinkError::BondNotFound),
-        };
-
+        let bond = self.links.get(uid).ok_or(LinkError::BondNotFound)?; //todo 减少持有锁时间
         let (candidates, total_weight) = bond
             .links
             .iter()
