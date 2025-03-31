@@ -2,11 +2,13 @@ use super::{FileMultiRange, FileRange, StackAllocatedPefered};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::FutureExt;
+use rayon::range;
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 use std::hint::unlikely;
 use std::io::Result as IoResult;
 use std::io::SeekFrom;
+use std::ops::Range;
 use std::{path::Path, sync::Arc};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -24,7 +26,20 @@ pub struct HotFile {
 
 impl HotFile {
     // todo 优化初始化setlen
-    pub async fn open<P: AsRef<Path>>(path: P) -> IoResult<Self> {
+    pub async fn open_new<P: AsRef<Path>>(path: P) -> IoResult<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            disk: Mutex::new(file),
+            dirty: Default::default(),
+        })
+    }
+
+    pub async fn open_existed<P: AsRef<Path>>(path: P) -> IoResult<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -63,16 +78,40 @@ impl HotFile {
     }
 
     #[inline]
-    async fn read_file_by_rangify(&self, itv: FileRange) -> IoResult<Bytes> {
-        let mut file_guard = self.disk.lock().await;
-        file_guard.seek(SeekFrom::Start(itv.start as u64)).await?;
-        let mut buf = BytesMut::with_capacity(itv.len());
-        file_guard.read_buf(&mut buf).await?;
+    async fn read_file_by_range(&self, rgn: FileRange) -> IoResult<Bytes> {
+        let mut disk_guard = self.disk.lock().await;
+        disk_guard.seek(SeekFrom::Start(rgn.start as u64)).await?;
+        let mut buf = BytesMut::with_capacity(rgn.interval());
+        disk_guard.read_exact(&mut buf).await?;
         Ok(buf.freeze())
     }
 
     pub async fn read(&self, mask: FileMultiRange) -> IoResult<Vec<Bytes>> {
-        let mut result = Vec::new();
+        let mut rst = Vec::new();
+
+        for mask_rgn in mask.as_ref() {
+            let dirty_blocks = self
+                .dirty
+                .lock()
+                .await
+                .iter()
+                .filter_map(|(&drt_rgn, &seg)| {
+                    let Some(overlap) = drt_rgn.intersect(mask_rgn) else {
+                        return None;
+                    };
+                    let offseted_seg = overlap.offset(drt_rgn.start).map(|x| seg.slice(x.into()));
+                    offseted_seg.map(|seg| (overlap, seg))
+                })
+                .collect::<BTreeMap<_,_>>();
+            let full_mask: FileMultiRange = (*mask_rgn).into();
+            let dirty_mask = FileMultiRange {
+                inner: dirty_blocks
+                    .keys()
+                    .cloned()
+                    .collect(),
+            };
+            let disk_mask = full_mask.subtract(&dirty_mask);
+        }
         for itv in mask.inner {
             let dirty_blocks: BTreeMap<FileRange, Bytes> = self
                 .dirty
@@ -95,7 +134,7 @@ impl HotFile {
                     .collect::<StackAllocatedPefered>()
                     .as_slice(),
             );
-            let disk_mask = full_mask.subtract(&dirty_mask);
+            
             let mut segments = dirty_blocks
                 .into_iter()
                 .map(|(itv, data)| (itv, Source::Dirty(data)))
@@ -115,7 +154,7 @@ impl HotFile {
                     }
                     Source::Disk => {
                         data_futures
-                            .push(async move { self.read_file_by_rangify(*range).await }.boxed());
+                            .push(async move { self.read_file_by_range(*range).await }.boxed());
                     }
                 }
             }
@@ -123,9 +162,9 @@ impl HotFile {
             for future in data_futures {
                 chunk_results.push(future.await?);
             }
-            result.extend(chunk_results);
+            rst.extend(chunk_results);
         }
-        Ok(result)
+        Ok(rst)
     }
 
     async fn compute_hash(&self, mask: FileMultiRange) -> IoResult<u64> {
@@ -168,7 +207,7 @@ mod tests {
         // 初始化文件内容
         tokio::fs::write(&path, b"abcdefghij").await.unwrap();
 
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
         let mask = FileMultiRange::new(vec![rangify!(0..10).unwrap()].as_slice());
         let result = hot_file.read(mask).await.unwrap();
 
@@ -178,7 +217,9 @@ mod tests {
     #[tokio::test]
     async fn read_entirely_from_dirty() {
         let temp_dir = tempdir().unwrap();
-        let hot_file = HotFile::open(temp_dir.path().join("test2")).await.unwrap();
+        let hot_file = HotFile::open_new(temp_dir.path().join("test2"))
+            .await
+            .unwrap();
 
         // 写入脏数据覆盖整个区间
         hot_file.write(Bytes::from("12345"), 0);
@@ -195,7 +236,7 @@ mod tests {
 
         // 初始化文件内容
         tokio::fs::write(&path, b"abcdefghij").await.unwrap();
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
 
         // 写入部分脏数据
         hot_file.write(Bytes::from("123"), 2); // 覆盖 2-5
@@ -217,7 +258,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
 
         // 写入两个脏块
         hot_file.write(Bytes::from("123"), 3); // 3-6
@@ -244,7 +285,7 @@ mod tests {
         let original_data = b"abcdefghijklmnopqrstuvwxyz";
         tokio::fs::write(&path, original_data).await.unwrap();
 
-        let hot_file = Arc::new(HotFile::open(&path).await.unwrap());
+        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
         let mask = FileMultiRange::new(vec![rangify!(0..26).unwrap()].as_slice());
 
         let computed = hot_file.compute_hash(mask).await.unwrap();
@@ -259,7 +300,7 @@ mod tests {
         let path = dir.path().join("test2");
 
         tokio::fs::write(&path, b"base_data").await.unwrap();
-        let hot_file = Arc::new(HotFile::open(&path).await.unwrap());
+        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
 
         // 写入覆盖全区的脏数据
         hot_file.write(Bytes::from("new_data"), 0);
@@ -277,7 +318,7 @@ mod tests {
         let path = dir.path().join("test3");
 
         tokio::fs::write(&path, b"hello_world").await.unwrap();
-        let hot_file = Arc::new(HotFile::open(&path).await.unwrap());
+        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
 
         // 写入两个脏块
         hot_file.write(Bytes::from("HELLO"), 0); // 覆盖 0..5
@@ -298,7 +339,7 @@ mod tests {
         tokio::fs::write(&path, b"abcdefghijklmnopqrst")
             .await
             .unwrap();
-        let hot_file = Arc::new(HotFile::open(&path).await.unwrap());
+        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
 
         // 写入不连续脏块
         hot_file.write(Bytes::from("123"), 3); // 3-6
@@ -325,7 +366,7 @@ mod tests {
         let path = dir.path().join("test_sync_basic");
 
         // 初始化对象
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
 
         // 写入脏数据并同步
         hot_file.write(Bytes::from("hello"), 0);
@@ -344,7 +385,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_sync_multiple");
 
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
 
         // 写入多个不连续区块
         hot_file.write(Bytes::from("head"), 0);
@@ -362,7 +403,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_overlap");
 
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
 
         // 第一次写入
         hot_file.write(Bytes::from("aaaaa"), 0);
@@ -381,7 +422,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_concurrent");
 
-        let hot_file = Arc::new(HotFile::open(&path).await.unwrap());
+        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
 
         // 初始同步
         hot_file.write(Bytes::from("base"), 0);
@@ -401,7 +442,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_empty");
 
-        let hot_file = HotFile::open(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&path).await.unwrap();
 
         // 空同步不应报错
         let result = hot_file.sync().await;

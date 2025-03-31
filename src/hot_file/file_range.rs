@@ -6,8 +6,6 @@ use std::{
 };
 use thiserror::Error;
 
-pub const STACK_BUFFERED: usize = 8;
-
 #[derive(Debug, Error, PartialEq)]
 pub enum FileRangeError {
     #[error("Invalid range: {start:?} - {end:?}")]
@@ -34,10 +32,14 @@ impl FileRange {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn interval(&self) -> usize {
         self.end - self.start
     }
 
+    #[inline]
+    pub fn pair(&self) -> (usize, usize) {
+        (self.start, self.end)
+    }
     #[inline]
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         let start = self.start.max(other.start);
@@ -75,8 +77,16 @@ impl FileRange {
     }
 
     #[inline]
-    pub const fn contains(&self, other: &Self) -> bool {
+    pub fn contains(&self, other: &Self) -> bool {
         self.start <= other.start && self.end >= other.end
+    }
+
+    #[inline]
+    pub fn offset(&self, offset: usize) -> Option<Self> {
+        (offset <= self.start).then_some(Self {
+            start: self.start - offset,
+            end: self.end - offset,
+        })
     }
 }
 
@@ -212,9 +222,12 @@ impl ToRangeBoundPair for (usize, usize) {
     }
 }
 
+pub const STACK_BUFFERED_SIZE: usize = 8;
+pub type StackBufferedFileRanges = SmallVec<[FileRange; STACK_BUFFERED_SIZE]>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileMultiRange {
-    pub inner: SmallVec<[FileRange; STACK_BUFFERED]>,
+    pub inner: StackBufferedFileRanges,
 }
 
 impl FileMultiRange {
@@ -320,7 +333,7 @@ impl FileMultiRange {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn interval_count(&self) -> usize {
         self.inner.len()
     }
 
@@ -330,8 +343,14 @@ impl FileMultiRange {
     }
 
     #[inline]
-    pub fn total_len(&self) -> usize {
-        self.inner.iter().map(|r| r.len()).sum()
+    pub fn interval(&self) -> usize {
+        self.inner.iter().map(|r| r.interval()).sum()
+    }
+}
+
+impl AsRef<StackBufferedFileRanges> for FileMultiRange {
+    fn as_ref(&self) -> &StackBufferedFileRanges {
+        todo!()
     }
 }
 
@@ -385,7 +404,7 @@ mod tests {
     // FileRange 基础测试
     #[test]
     fn filerange_basics() {
-        assert_eq!(FileRange::try_new(1, 3).unwrap().len(), 2);
+        assert_eq!(FileRange::try_new(1, 3).unwrap().interval(), 2);
         assert!(FileRange::try_new(5, 5).is_none());
     }
 
@@ -570,7 +589,7 @@ mod tests {
         for i in (0..100).step_by(2) {
             mr.add_checked(i, i + 1).unwrap();
         }
-        assert_eq!(mr.len(), 50);
-        assert_eq!(mr.total_len(), 50);
+        assert_eq!(mr.interval_count(), 50);
+        assert_eq!(mr.interval(), 50);
     }
 }
