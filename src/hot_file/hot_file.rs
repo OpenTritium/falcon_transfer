@@ -1,15 +1,19 @@
-use super::{FileMultiRange, FileRange, StackAllocatedPefered};
+use super::FileRangeError;
+use super::{FileMultiRange, FileRange};
 use bytes::{Bytes, BytesMut};
-use dashmap::DashMap;
 use futures::FutureExt;
-use rayon::range;
+use futures::future::join_all;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::hash::Hasher;
+use std::hint::likely;
 use std::hint::unlikely;
 use std::io::Result as IoResult;
 use std::io::SeekFrom;
-use std::ops::Range;
-use std::{path::Path, sync::Arc};
+use std::ops::Bound;
+use std::path::Path;
+use std::usize;
+use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -18,6 +22,13 @@ use xxhash_rust::xxh3::Xxh3;
 pub type Offset = usize;
 
 // 来个接口用于抽象文件和缓存
+#[derive(Debug, Error)]
+pub enum HotFileError {
+    #[error(transparent)]
+    FileRangeError(#[from] FileRangeError),
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+}
 
 pub struct HotFile {
     disk: Mutex<File>,
@@ -52,404 +63,284 @@ impl HotFile {
         })
     }
 
+    /// 保证不插入重叠的 range
+    /// todo 锁优化
     pub async fn write(&self, buf: Bytes, offset: Offset) {
-        self.dirty.lock().await.insert(
-            FileRange {
-                start: offset,
-                end: offset + buf.len(),
-            },
-            buf,
-        );
+        let buf_len = buf.len();
+        let buf_rgn = FileRange::new(offset, offset + buf_len);
+        let left_bnd = Bound::Unbounded;
+        let right_bnd = Bound::Included(FileRange::new(buf_rgn.end, usize::MAX));
+        let overlapped = self
+            .dirty
+            .lock()
+            .await
+            .range((left_bnd, right_bnd))
+            .filter(|(rgn, _)| rgn.intersect(&buf_rgn).is_some())
+            .map(|(&rgn, buf)| (rgn, buf.clone()))
+            .collect::<Vec<_>>();
+        let merged_start = overlapped
+            .iter()
+            .map(|(r, _)| r.start)
+            .fold(buf_rgn.start, |acc, s| acc.min(s));
+        let merged_end = overlapped
+            .iter()
+            .map(|(r, _)| r.end)
+            .fold(buf_rgn.end, |acc, e| acc.max(e));
+        let merged_rgn = FileRange::new(merged_start, merged_end);
+        let mut merged_buf = BytesMut::with_capacity(merged_rgn.interval());
+        merged_buf.resize(merged_rgn.interval(), 0u8);
+        for (rgn, buf) in &overlapped {
+            let merged_start = rgn.start - merged_start;
+            let merged_end = merged_start + rgn.interval();
+            merged_buf[merged_start..merged_end].copy_from_slice(buf);
+        }
+        let merged_start = offset - merged_start;
+        merged_buf[merged_start..merged_start + buf_len].copy_from_slice(&buf);
+        let mut dirty_guard = self.dirty.lock().await;
+        for (rgn, _) in overlapped {
+            dirty_guard.remove(&rgn);
+        }
+        dirty_guard.insert(merged_rgn, merged_buf.freeze());
     }
 
     pub async fn sync(&self) -> IoResult<()> {
+        let snapshot = {
+            let dirty_guard = self.dirty.lock().await;
+            if unlikely(dirty_guard.is_empty()) {
+                return Ok(());
+            }
+            dirty_guard
+                .iter()
+                .map(|(&rgn, data)| (rgn, data.clone()))
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut disk_guard = self.disk.lock().await;
+            for (rgn, buf) in &snapshot {
+                disk_guard.seek(SeekFrom::Start(rgn.start as u64)).await?;
+                disk_guard.write_all(buf).await?;
+            }
+            disk_guard.sync_data().await?;
+        }
         let mut dirty_guard = self.dirty.lock().await;
-        if unlikely(dirty_guard.is_empty()) {
-            return Ok(());
+        for (rgn, _) in snapshot.iter() {
+            dirty_guard.remove(rgn);
         }
-        let mut file_guard = self.disk.lock().await;
-        let tmp = std::mem::take(&mut *dirty_guard);
-        for (rgn, buf) in tmp.into_iter() {
-            file_guard.seek(SeekFrom::Start(rgn.start as u64)).await?;
-            file_guard.write_all(&buf).await?;
-        }
-        file_guard.sync_all().await?;
         Ok(())
     }
 
     #[inline]
-    async fn read_file_by_range(&self, rgn: FileRange) -> IoResult<Bytes> {
+    async fn read_disk_by_range(&self, rgn: FileRange) -> IoResult<Bytes> {
         let mut disk_guard = self.disk.lock().await;
         disk_guard.seek(SeekFrom::Start(rgn.start as u64)).await?;
-        let mut buf = BytesMut::with_capacity(rgn.interval());
+        let buf_len = rgn.interval();
+        let mut buf = BytesMut::with_capacity(buf_len);
+        buf.resize(buf_len, 0);
         disk_guard.read_exact(&mut buf).await?;
         Ok(buf.freeze())
     }
 
-    pub async fn read(&self, mask: FileMultiRange) -> IoResult<Vec<Bytes>> {
+    pub async fn read(&self, mask: FileMultiRange) -> Result<Vec<Bytes>, HotFileError> {
         let mut rst = Vec::new();
-
-        for mask_rgn in mask.as_ref() {
-            let dirty_blocks = self
+        for sub_rgn in mask.as_ref() {
+            let left_bnd = Bound::Unbounded;
+            let right_bnd = Bound::Included(FileRange::new(sub_rgn.end, usize::MAX));
+            let dirty_segs = self
                 .dirty
                 .lock()
                 .await
-                .iter()
-                .filter_map(|(&drt_rgn, &seg)| {
-                    let Some(overlap) = drt_rgn.intersect(mask_rgn) else {
-                        return None;
-                    };
-                    let offseted_seg = overlap.offset(drt_rgn.start).map(|x| seg.slice(x.into()));
-                    offseted_seg.map(|seg| (overlap, seg))
+                .range((left_bnd, right_bnd))
+                .filter_map(|(drt_rgn, seg)| {
+                    sub_rgn
+                        .intersect(drt_rgn)
+                        .map(|ovlp| (ovlp, seg.slice(ovlp.offset(drt_rgn.start).unwrap())))
                 })
-                .collect::<BTreeMap<_,_>>();
-            let full_mask: FileMultiRange = (*mask_rgn).into();
-            let dirty_mask = FileMultiRange {
-                inner: dirty_blocks
-                    .keys()
-                    .cloned()
-                    .collect(),
-            };
-            let disk_mask = full_mask.subtract(&dirty_mask);
-        }
-        for itv in mask.inner {
-            let dirty_blocks: BTreeMap<FileRange, Bytes> = self
-                .dirty
-                .iter()
-                .filter_map(|entry| {
-                    let (dirty_range, data) = entry.pair();
-                    dirty_range.intersect(&itv).map(|overlap| {
-                        let slice = data.slice(
-                            (overlap.start - dirty_range.start)..(overlap.end - dirty_range.start),
-                        );
-                        (overlap, slice)
-                    })
-                })
-                .collect();
-            let full_mask: FileMultiRange = itv.into();
-            let dirty_mask = FileMultiRange::new(
-                dirty_blocks
-                    .keys()
-                    .cloned()
-                    .collect::<StackAllocatedPefered>()
-                    .as_slice(),
-            );
-            
-            let mut segments = dirty_blocks
+                .collect::<HashMap<_, _>>();
+
+            let dirty_mask = FileMultiRange::try_from(
+                dirty_segs.keys().copied().collect::<Vec<_>>().as_slice(),
+            )?;
+            let sub_mask: FileMultiRange = (*sub_rgn).into();
+            let disk_mask = sub_mask.subtract(&dirty_mask);
+            // 注意这里的迭代器顺序并不和需求一致
+            let fut_iter = dirty_segs
                 .into_iter()
-                .map(|(itv, data)| (itv, Source::Dirty(data)))
-                .collect::<BTreeMap<_, _>>();
-            segments.extend(
-                disk_mask
-                    .inner
-                    .iter()
-                    .map(|itv| (*itv, Source::Disk))
-                    .collect::<BTreeMap<_, _>>(),
-            );
-            let mut data_futures = Vec::new();
-            for (range, source) in &segments {
-                match source {
-                    Source::Dirty(data) => {
-                        data_futures.push(async { Ok(data.clone()) }.boxed());
-                    }
-                    Source::Disk => {
-                        data_futures
-                            .push(async move { self.read_file_by_range(*range).await }.boxed());
-                    }
-                }
-            }
-            let mut chunk_results = Vec::with_capacity(data_futures.len());
-            for future in data_futures {
-                chunk_results.push(future.await?);
-            }
-            rst.extend(chunk_results);
+                .map(|(rgn, data)| (rgn, BufferSource::Dirty(data)))
+                .chain(disk_mask.inner.iter().map(|rgn| (*rgn, BufferSource::Disk)))
+                .map(|(rgn, src)| async move {
+                    (
+                        rgn,
+                        match src {
+                            BufferSource::Dirty(data) => Ok(data),
+                            BufferSource::Disk => self.read_disk_by_range(rgn).await,
+                        },
+                    )
+                });
+            let mut chunk = join_all(fut_iter)
+                .await
+                .into_iter()
+                .map(|(rgn, rst)| rst.map(|buf| (rgn, buf)))
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            rst.append(&mut chunk.values().cloned().collect());
         }
         Ok(rst)
     }
 
-    async fn compute_hash(&self, mask: FileMultiRange) -> IoResult<u64> {
-        let chunks = self.read(mask).await?;
+    async fn compute_hash(&self, buf_chunk: &[impl AsRef<[u8]>]) -> IoResult<u64> {
         let mut hasher = Xxh3::new();
-        for chunk in chunks {
-            hasher.update(chunk.as_ref());
+        for buf in buf_chunk {
+            hasher.update(buf.as_ref());
         }
         Ok(hasher.finish())
     }
 }
 
 /// 数据源标识
-enum Source {
+enum BufferSource {
     Dirty(Bytes),
     Disk,
 }
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
-    use xxhash_rust::xxh3::xxh3_64;
+    use core::slice::SlicePattern;
 
     use super::*;
+    use bytes::Bytes;
+    use tempfile::tempdir;
+    use tokio::io::AsyncReadExt;
 
-    fn concat_bytes(chunks: Vec<Bytes>) -> Bytes {
-        chunks
-            .iter()
-            .fold(BytesMut::new(), |mut acc, chunk| {
-                acc.extend_from_slice(chunk);
-                acc
-            })
-            .freeze()
-    }
     #[tokio::test]
-    async fn read_entirely_from_disk() {
+    async fn test_create_new_file() {
         let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("test1");
+        let file_path = temp_dir.path().join("new_file");
 
-        // 初始化文件内容
-        tokio::fs::write(&path, b"abcdefghij").await.unwrap();
+        // 成功创建新文件
+        let hot_file = HotFile::open_new(&file_path).await.unwrap();
 
-        let hot_file = HotFile::open_new(&path).await.unwrap();
-        let mask = FileMultiRange::new(vec![rangify!(0..10).unwrap()].as_slice());
-        let result = hot_file.read(mask).await.unwrap();
+        // 重复创建应失败
+        assert!(HotFile::open_new(&file_path).await.is_err());
 
-        assert_eq!(concat_bytes(result), Bytes::from("abcdefghij"));
+        // 用open_existed打开应成功
+        let _ = HotFile::open_existed(&file_path).await.unwrap();
     }
 
     #[tokio::test]
-    async fn read_entirely_from_dirty() {
+    async fn test_write_merge() {
         let temp_dir = tempdir().unwrap();
-        let hot_file = HotFile::open_new(temp_dir.path().join("test2"))
+        let hot_file = HotFile::open_new(temp_dir.path().join("merge_test"))
             .await
             .unwrap();
 
-        // 写入脏数据覆盖整个区间
-        hot_file.write(Bytes::from("12345"), 0);
-        let mask = FileMultiRange::new(vec![rangify!(0..5).unwrap()].as_slice());
-        let result = hot_file.read(mask).await.unwrap();
+        // 写入不重叠区域
+        hot_file.write(Bytes::from("hello"), 0).await; // 0..5
+        hot_file.write(Bytes::from("world"), 10).await; // 10..15
+        {
+            let dirty = hot_file.dirty.lock().await;
+            assert_eq!(dirty.len(), 2);
+        }
 
-        assert_eq!(concat_bytes(result), Bytes::from("12345"));
+        // 写入重叠区域
+        hot_file.write(Bytes::from("XXXX"), 8).await; // 8..12
+        {
+            let dirty = hot_file.dirty.lock().await;
+            assert_eq!(dirty.len(), 2);
+        }
     }
 
     #[tokio::test]
-    async fn read_mixed_dirty_and_disk() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test3");
+    async fn test_sync_to_disk() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("sync_test");
 
-        // 初始化文件内容
-        tokio::fs::write(&path, b"abcdefghij").await.unwrap();
-        let hot_file = HotFile::open_new(&path).await.unwrap();
+        let hot_file = HotFile::open_new(&file_path).await.unwrap();
 
-        // 写入部分脏数据
-        hot_file.write(Bytes::from("123"), 2); // 覆盖 2-5
-        hot_file.write(Bytes::from("45"), 7); // 覆盖 7-9
+        // 写入并同步
+        hot_file.write(Bytes::from("test data"), 0).await;
+        hot_file.sync().await.unwrap();
 
-        let mask = FileMultiRange::new(vec![rangify!(0..10).unwrap()].as_slice());
-        let result = hot_file.read(mask).await.unwrap();
+        // 验证磁盘内容
+        let mut file = File::open(&file_path).await.unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).await.unwrap();
+        assert_eq!(contents, b"test data");
 
-        // 预期结果: ab(disk) + 123(dirty) + fg(disk) + 45(dirty) + j(disk)
-        assert_eq!(concat_bytes(result), Bytes::from("ab123fg45j"));
+        // 验证dirty清理
+        assert!(hot_file.dirty.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn read_multiple_rangifys() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test4");
+    async fn test_read_combination() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("read_test");
 
-        tokio::fs::write(&path, b"abcdefghijklmnopqrst")
-            .await
-            .unwrap();
+        // 初始化磁盘数据
+        {
+            let mut file = File::create(&file_path).await.unwrap();
+            file.write_all(b"ABCDEFGHIJKL").await.unwrap();
+            // ABCDEFGHIJKL
+        }
 
-        let hot_file = HotFile::open_new(&path).await.unwrap();
+        let hot_file = HotFile::open_existed(&file_path).await.unwrap();
 
-        // 写入两个脏块
-        hot_file.write(Bytes::from("123"), 3); // 3-6
-        hot_file.write(Bytes::from("45"), 8); // 8-10
+        // 写入部分缓存
+        hot_file.write(Bytes::from("1234"), 2).await; //2..6
+        //AB1234GHIJKL
+        hot_file.write(Bytes::from("zz"), 9).await; //9..11
+        //AB1234GHIzzL
 
-        let mask = FileMultiRange::new(
+        // 构建读取范围: 0-12
+        let mask = FileMultiRange::try_from([0..12].as_slice()).unwrap();
+        let result = hot_file.read(mask).await.unwrap();
+        assert_eq!(result.len(), 5);
+        // 拼接结果
+        let mut final_data = Vec::new();
+        for chunk in result {
+            final_data.extend_from_slice(chunk.as_slice());
+        }
+
+        // 验证数据组合正确
+        assert_eq!(
+            final_data,
             vec![
-                rangify!(0..4).unwrap(),  // 0-4 (0-3 clean + 3-4 dirty)
-                rangify!(6..10).unwrap(), // 6-8 clean + 8-10 dirty
+                b'A', b'B', // 0-2 (磁盘)
+                b'1', b'2', b'3', b'4', // 2-6 (缓存)
+                b'G', b'H', b'I', // 6-9 (磁盘)
+                b'z', b'z', // 9-11 (缓存)
+                b'L'  // 11-12 (磁盘)
             ]
-            .as_slice(),
         );
-
-        let result = hot_file.read(mask).await.unwrap();
-
-        assert_eq!(concat_bytes(result), Bytes::from("abc1gh45"));
     }
 
     #[tokio::test]
-    async fn test_full_disk_hash() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test1");
-
-        let original_data = b"abcdefghijklmnopqrstuvwxyz";
-        tokio::fs::write(&path, original_data).await.unwrap();
-
-        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
-        let mask = FileMultiRange::new(vec![rangify!(0..26).unwrap()].as_slice());
-
-        let computed = hot_file.compute_hash(mask).await.unwrap();
-        let expected = xxh3_64(original_data);
-
-        assert_eq!(computed, expected);
-    }
-
-    #[tokio::test]
-    async fn test_dirty_data_override() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test2");
-
-        tokio::fs::write(&path, b"base_data").await.unwrap();
-        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
-
-        // 写入覆盖全区的脏数据
-        hot_file.write(Bytes::from("new_data"), 0);
-        let mask = FileMultiRange::new(vec![rangify!(0..8).unwrap()].as_slice());
-
-        let computed = hot_file.compute_hash(mask).await.unwrap();
-        let expected = xxh3_64(b"new_data");
-
-        assert_eq!(computed, expected);
-    }
-
-    #[tokio::test]
-    async fn test_merged_hash() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test3");
-
-        tokio::fs::write(&path, b"hello_world").await.unwrap();
-        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
-
-        // 写入两个脏块
-        hot_file.write(Bytes::from("HELLO"), 0); // 覆盖 0..5
-        hot_file.write(Bytes::from("D"), 10); // 覆盖 10
-
-        let mask = FileMultiRange::new(vec![rangify!(0..11).unwrap()].as_slice());
-        let computed = hot_file.compute_hash(mask).await.unwrap();
-
-        let expected = xxh3_64(b"HELLO_worlD");
-        assert_eq!(computed, expected);
-    }
-
-    #[tokio::test]
-    async fn test_sparse_rangifys() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test4");
-
-        tokio::fs::write(&path, b"abcdefghijklmnopqrst")
+    async fn test_complex_merge() {
+        let temp_dir = tempdir().unwrap();
+        let hot_file = HotFile::open_new(temp_dir.path().join("complex_merge"))
             .await
             .unwrap();
-        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
 
-        // 写入不连续脏块
-        hot_file.write(Bytes::from("123"), 3); // 3-6
-        hot_file.write(Bytes::from("45"), 8); // 8-10
+        // 初始写入
+        hot_file.write(Bytes::from("hello"), 0).await; // 0..5
+        hot_file.write(Bytes::from("world"), 3).await; // 3..8
+        hot_file.write(Bytes::from("rust"), 7).await; // 7..11
 
-        let mask = FileMultiRange::new(
-            vec![
-                rangify!(0..4).unwrap(),  // 0-3 clean + 3-4 dirty
-                rangify!(6..10).unwrap(), // 6-8 clean + 8-10 dirty
-            ]
-            .as_slice(),
-        );
+        // 验证合并结果
+        {
+            let dirty = hot_file.dirty.lock().await;
+            assert_eq!(dirty.len(), 1);
+            let (range, data) = dirty.iter().next().unwrap();
+            assert_eq!(range.start, 0);
+            assert_eq!(range.end, 11);
+            assert_eq!(data.as_ref(), b"helworlrust");
+        }
 
-        let computed = hot_file.compute_hash(mask).await.unwrap();
-
-        // 预期数据组合：abc1 + gh45
-        let expected = xxh3_64(b"abc1gh45");
-        assert_eq!(computed, expected);
-    }
-
-    #[tokio::test]
-    async fn sync_basic_operation() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test_sync_basic");
-
-        // 初始化对象
-        let hot_file = HotFile::open_new(&path).await.unwrap();
-
-        // 写入脏数据并同步
-        hot_file.write(Bytes::from("hello"), 0);
+        // 同步并验证磁盘内容
         hot_file.sync().await.unwrap();
-
-        // 验证文件内容
-        let content = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(content, b"hello");
-
-        // 检查脏数据已清除
-        assert!(hot_file.dirty.is_empty());
-    }
-
-    #[tokio::test]
-    async fn sync_multiple_blocks() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test_sync_multiple");
-
-        let hot_file = HotFile::open_new(&path).await.unwrap();
-
-        // 写入多个不连续区块
-        hot_file.write(Bytes::from("head"), 0);
-        hot_file.write(Bytes::from("tail"), 10);
-        hot_file.sync().await.unwrap();
-
-        // 验证文件内容
-        let content = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(&content[0..4], b"head");
-        assert_eq!(&content[10..14], b"tail");
-    }
-
-    #[tokio::test]
-    async fn sync_overlapping_writes() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test_overlap");
-
-        let hot_file = HotFile::open_new(&path).await.unwrap();
-
-        // 第一次写入
-        hot_file.write(Bytes::from("aaaaa"), 0);
-        hot_file.sync().await.unwrap();
-
-        // 覆盖写入
-        hot_file.write(Bytes::from("bbbbb"), 0);
-        hot_file.sync().await.unwrap();
-
-        let content = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(content, b"bbbbb");
-    }
-
-    #[tokio::test]
-    async fn sync_with_concurrent_writes() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test_concurrent");
-
-        let hot_file = Arc::new(HotFile::open_new(&path).await.unwrap());
-
-        // 初始同步
-        hot_file.write(Bytes::from("base"), 0);
-        hot_file.sync().await.unwrap();
-
-        // 同步后写入新数据
-        hot_file.write(Bytes::from("new"), 5);
-        hot_file.sync().await.unwrap();
-
-        let content = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(&content[0..4], b"base");
-        assert_eq!(&content[5..8], b"new");
-    }
-
-    #[tokio::test]
-    async fn sync_empty_dirty() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test_empty");
-
-        let hot_file = HotFile::open_new(&path).await.unwrap();
-
-        // 空同步不应报错
-        let result = hot_file.sync().await;
-        assert!(result.is_ok());
-
-        // 文件应保持空状态
-        let metadata = tokio::fs::metadata(&path).await.unwrap();
-        assert_eq!(metadata.len(), 0);
+        let mut file = File::open(temp_dir.path().join("complex_merge"))
+            .await
+            .unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).await.unwrap();
+        assert_eq!(contents, b"helworlrust");
     }
 }

@@ -2,7 +2,7 @@ use smallvec::{SmallVec, smallvec};
 use std::{
     cmp::Ordering,
     hint::{likely, unlikely},
-    ops::{Bound, Range, RangeInclusive},
+    ops::{Bound, Range, RangeBounds, RangeInclusive},
 };
 use thiserror::Error;
 
@@ -27,6 +27,10 @@ pub struct FileRange {
 
 impl FileRange {
     #[inline]
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+    #[inline]
     pub fn try_new(start: usize, end: usize) -> Option<Self> {
         likely(start < end).then(|| Self { start, end })
     }
@@ -40,6 +44,7 @@ impl FileRange {
     pub fn pair(&self) -> (usize, usize) {
         (self.start, self.end)
     }
+
     #[inline]
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         let start = self.start.max(other.start);
@@ -90,6 +95,18 @@ impl FileRange {
     }
 }
 
+impl RangeBounds<usize> for FileRange {
+    #[inline]
+    fn start_bound(&self) -> Bound<&usize> {
+        Bound::Included(&self.start)
+    }
+
+    #[inline]
+    fn end_bound(&self) -> Bound<&usize> {
+        Bound::Excluded(&self.end)
+    }
+}
+
 impl From<FileRange> for FileMultiRange {
     #[inline]
     fn from(rgn: FileRange) -> Self {
@@ -123,7 +140,9 @@ impl PartialOrd for FileRange {
 impl Ord for FileRange {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.start.cmp(&other.start)
+        self.start
+            .cmp(&other.start)
+            .then_with(|| self.end.cmp(&other.end))
     }
 }
 
@@ -311,10 +330,7 @@ impl FileMultiRange {
                     break;
                 }
                 if likely(current.start < sub.start) {
-                    result.inner.push(FileRange {
-                        start: current.start,
-                        end: sub.start,
-                    });
+                    result.inner.push(FileRange::new(current.start, sub.start));
                 }
                 current.start = current.start.max(sub.end);
                 if unlikely(current.start >= current.end) {
@@ -350,7 +366,7 @@ impl FileMultiRange {
 
 impl AsRef<StackBufferedFileRanges> for FileMultiRange {
     fn as_ref(&self) -> &StackBufferedFileRanges {
-        todo!()
+        &self.inner
     }
 }
 
@@ -591,5 +607,170 @@ mod tests {
         }
         assert_eq!(mr.interval_count(), 50);
         assert_eq!(mr.interval(), 50);
+    }
+
+    #[test]
+    fn subtract_non_overlapping() {
+        let base = FileMultiRange::try_from([(10, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(5, 8)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![FileRange { start: 10, end: 20 }]
+        );
+    }
+
+    #[test]
+    fn subtract_partial_overlap() {
+        let base = FileMultiRange::try_from([(10, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(15, 25)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![FileRange { start: 10, end: 15 }]
+        );
+    }
+
+    #[test]
+    fn subtract_split_middle() {
+        let base = FileMultiRange::try_from([(10, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(15, 17)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![
+                FileRange { start: 10, end: 15 },
+                FileRange { start: 17, end: 20 }
+            ]
+        );
+    }
+
+    #[test]
+    fn subtract_exact_overlap() {
+        let base = FileMultiRange::try_from([(5, 10)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(5, 10)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn subtract_multiple_holes() {
+        let base = FileMultiRange::try_from([(0, 100)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(10, 20), (30, 40), (50, 60)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![
+                FileRange { start: 0, end: 10 },
+                FileRange { start: 20, end: 30 },
+                FileRange { start: 40, end: 50 },
+                FileRange {
+                    start: 60,
+                    end: 100
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn subtract_adjacent_ranges() {
+        let base = FileMultiRange::try_from([(10, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(20, 25)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![FileRange { start: 10, end: 20 }]
+        );
+    }
+
+    #[test]
+    fn subtract_from_multiple_segments() {
+        let base = FileMultiRange::try_from([(1, 5), (8, 12)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(3, 10)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![
+                FileRange { start: 1, end: 3 },
+                FileRange { start: 10, end: 12 }
+            ]
+        );
+    }
+
+    #[test]
+    fn subtract_edge_cases() {
+        // 被减区间刚好在起始位置
+        let base = FileMultiRange::try_from([(10, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(10, 15)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![FileRange { start: 15, end: 20 }]
+        );
+
+        // 被减区间刚好在结束位置
+        let subtract = FileMultiRange::try_from([(18, 20)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![FileRange { start: 10, end: 18 }]
+        );
+    }
+
+    #[test]
+    fn subtract_complex_overlap() {
+        // 原区间有多个重叠部分
+        let base = FileMultiRange::try_from([(0, 5), (8, 12), (15, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::try_from([(3, 10), (14, 18)].as_slice()).unwrap();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![
+                FileRange { start: 0, end: 3 },
+                FileRange { start: 10, end: 12 },
+                FileRange { start: 18, end: 20 }
+            ]
+        );
+    }
+
+    #[test]
+    fn subtract_empty_subtractor() {
+        let base = FileMultiRange::try_from([(10, 20)].as_slice()).unwrap();
+        let subtract = FileMultiRange::new();
+        let result = base.subtract(&subtract);
+        assert_eq!(
+            result.inner,
+            smallvec_inline![FileRange { start: 10, end: 20 }]
+        );
+    }
+
+    #[test]
+    fn subtract_multiple_operations() {
+        let mut base = FileMultiRange::try_from([(0, 100)].as_slice()).unwrap();
+        let subtract1 = FileMultiRange::try_from([(20, 40)].as_slice()).unwrap();
+        base = base.subtract(&subtract1);
+        assert_eq!(
+            base.inner,
+            smallvec_inline![
+                FileRange { start: 0, end: 20 },
+                FileRange {
+                    start: 40,
+                    end: 100
+                }
+            ]
+        );
+
+        let subtract2 = FileMultiRange::try_from([(10, 50)].as_slice()).unwrap();
+        base = base.subtract(&subtract2);
+        assert_eq!(
+            base.inner,
+            smallvec_inline![
+                FileRange { start: 0, end: 10 },
+                FileRange {
+                    start: 50,
+                    end: 100
+                }
+            ]
+        );
     }
 }
