@@ -31,8 +31,13 @@ impl FileRange {
         Self { start, end }
     }
     #[inline]
-    pub fn try_new(start: usize, end: usize) -> Option<Self> {
-        likely(start < end).then(|| Self { start, end })
+    pub fn try_new(start: usize, end: usize) -> Result<Self,FileRangeError> {
+        likely(start < end)
+            .then(|| Self { start, end })
+            .ok_or_else(|| FileRangeError::InvalidRange {
+                start: Bound::Included(start),
+                end: Bound::Excluded(end),
+            })
     }
 
     #[inline]
@@ -258,10 +263,7 @@ impl FileMultiRange {
     }
 
     pub fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
-        let range = FileRange::try_new(start, end).ok_or(FileRangeError::InvalidRange {
-            start: Bound::Included(start),
-            end: Bound::Excluded(end),
-        })?;
+        let range = FileRange::try_new(start, end)?;
         if unlikely(self.inner.is_empty()) {
             self.inner.push(range);
             return Ok(());
@@ -365,6 +367,7 @@ impl FileMultiRange {
 }
 
 impl AsRef<StackBufferedFileRanges> for FileMultiRange {
+    #[inline]
     fn as_ref(&self) -> &StackBufferedFileRanges {
         &self.inner
     }
@@ -421,7 +424,7 @@ mod tests {
     #[test]
     fn filerange_basics() {
         assert_eq!(FileRange::try_new(1, 3).unwrap().interval(), 2);
-        assert!(FileRange::try_new(5, 5).is_none());
+        assert!(FileRange::try_new(5, 5).is_err());
     }
 
     // 边界条件测试
@@ -430,14 +433,14 @@ mod tests {
         // 最小有效范围
         assert_eq!(
             FileRange::try_new(0, 1),
-            Some(FileRange { start: 0, end: 1 })
+            Ok(FileRange { start: 0, end: 1 })
         );
 
         // 最大值边界
         let max = usize::MAX;
         assert_eq!(
             FileRange::try_new(max - 1, max),
-            Some(FileRange {
+            Ok(FileRange {
                 start: max - 1,
                 end: max
             })
