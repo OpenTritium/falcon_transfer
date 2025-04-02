@@ -13,6 +13,7 @@ use std::usize;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -79,7 +80,17 @@ impl HotFile {
                 (buf_rgn.contains(&rgn) || buf_rgn.intersect(&rgn).is_some())
                     .then(|| (rgn, buf.clone()))
             })
+            .filter_map(|(&rgn, buf)| {
+                (buf_rgn.contains(&rgn) || buf_rgn.intersect(&rgn).is_some())
+                    .then(|| (rgn, buf.clone()))
+            })
             .collect::<Vec<_>>();
+        let (merged_start, merged_end) = overlapped.iter().map(|(r, _)| r).fold(
+            (buf_rgn.start, buf_rgn.end),
+            |(acc_start, acc_end), FileRange { start, end }| {
+                (acc_start.min(*start), acc_end.max(*end))
+            },
+        );
         let (merged_start, merged_end) = overlapped.iter().map(|(r, _)| r).fold(
             (buf_rgn.start, buf_rgn.end),
             |(acc_start, acc_end), FileRange { start, end }| {
@@ -137,13 +148,16 @@ impl HotFile {
     async fn read_disk_by_range(&self, rgn: FileRange) -> Result<Bytes, HotFileError> {
         let logical_len = self.sync_len_state.load(Ordering::Relaxed);
         if unlikely(rgn.end > logical_len) {
+        if unlikely(rgn.end > logical_len) {
             return Err(HotFileError::OutOfFile);
         }
         let mut disk_guard = self.disk.lock().await;
         let disk_len = disk_guard.metadata().await?.len() as usize;
         let read_rgn = FileRange::new(rgn.start, disk_len.min(rgn.end));
+        let read_rgn = FileRange::new(rgn.start, disk_len.min(rgn.end));
         let mut buf = BytesMut::with_capacity(rgn.interval());
         buf.resize(rgn.interval(), 0);
+        if likely(read_rgn.interval() > 0) {
         if likely(read_rgn.interval() > 0) {
             disk_guard
                 .seek(SeekFrom::Start(read_rgn.start as u64))
@@ -158,14 +172,17 @@ impl HotFile {
     pub async fn read(&self, mask: FileMultiRange) -> Result<Vec<Bytes>, HotFileError> {
         let mut rst = Vec::new();
         let dirty_guard = self.dirty.lock().await;
+        let dirty_guard = self.dirty.lock().await;
         for sub_rgn in mask.as_ref() {
             let left_bnd = Bound::Unbounded;
             let right_bnd = Bound::Included(FileRange::new(sub_rgn.end, usize::MAX));
+            let dirty_segs = dirty_guard
             let dirty_segs = dirty_guard
                 .range((left_bnd, right_bnd))
                 .filter_map(|(drt_rgn, seg)| {
                     sub_rgn
                         .intersect(drt_rgn)
+                        .map(|ovlp| (ovlp, seg.slice(ovlp.offset(drt_rgn.start, false).unwrap())))
                         .map(|ovlp| (ovlp, seg.slice(ovlp.offset(drt_rgn.start, false).unwrap())))
                 })
                 .collect::<HashMap<_, _>>();
@@ -188,8 +205,12 @@ impl HotFile {
                     }
                 });
             let mut chunk = try_join_all(fut_iter)
+            let mut chunk = try_join_all(fut_iter)
                 .await?
                 .into_iter()
+                .collect::<Vec<_>>();
+            chunk.sort_by_cached_key(|&(k, _)| k);
+            rst.append(&mut chunk.into_iter().map(|(_, v)| v).collect::<Vec<_>>());
                 .collect::<Vec<_>>();
             chunk.sort_by_cached_key(|&(k, _)| k);
             rst.append(&mut chunk.into_iter().map(|(_, v)| v).collect::<Vec<_>>());
@@ -511,6 +532,13 @@ mod tests {
         // AB CDEF GHI JK L0000
         // 00 1234 000 zz 0000X
         let expected = vec![
+            Bytes::from_static(b"AB"),      // 0..2 from DISK
+            Bytes::from_static(b"1"),       // 2..3 from DIRTY
+            Bytes::from_static(b"4"),       // 5..6 from DIRTY
+            Bytes::from_static(b"GH"),      // 6..8 from DISK
+            Bytes::from_static(b"z"),       // 10..11 from DISK
+            Bytes::from_static(b"L\0\0\0"), // 11..12 from DISK
+            Bytes::from_static(b"X"),       // 12..16 from DIRTY
             Bytes::from_static(b"AB"),      // 0..2 from DISK
             Bytes::from_static(b"1"),       // 2..3 from DIRTY
             Bytes::from_static(b"4"),       // 5..6 from DIRTY
