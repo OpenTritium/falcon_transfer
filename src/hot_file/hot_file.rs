@@ -1,14 +1,10 @@
-use super::FileRangeError;
-use super::{FileMultiRange, FileRange};
+use super::{FileMultiRange, FileRange, FileRangeError};
 use bytes::{Bytes, BytesMut};
-use futures::FutureExt;
-use futures::future::{join_all, try_join_all};
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use futures::future::try_join_all;
+use std::collections::{BTreeMap,HashMap};
 use std::hash::Hasher;
-use std::hint::likely;
-use std::hint::unlikely;
-use std::io::Result as IoResult;
+use std::hint::{likely,unlikely};
+use tokio::io::Result as IoResult;
 use std::io::SeekFrom;
 use std::ops::Bound;
 use std::path::Path;
@@ -16,19 +12,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::usize;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use xxhash_rust::xxh3::Xxh3;
 
 pub type Offset = usize;
 
-// 来个接口用于抽象文件和缓存
 #[derive(Debug, Error)]
 pub enum HotFileError {
     #[error(transparent)]
     FileRangeError(#[from] FileRangeError),
     #[error(transparent)]
-    IoError(#[from] std::io::Error),
+    IoError(#[from] tokio::io::Error),
     #[error("Reading bytes beyond the file boundary.")]
     OutOfFile,
 }
@@ -40,7 +35,6 @@ pub struct HotFile {
 }
 
 impl HotFile {
-    // todo 优化初始化setlen
     pub async fn open_new<P: AsRef<Path>>(path: P) -> IoResult<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -71,8 +65,6 @@ impl HotFile {
         })
     }
 
-    /// 保证不插入重叠的 range
-    /// todo 锁优化
     pub async fn write(&self, buf: Bytes, offset: Offset) -> Result<(), HotFileError> {
         let buf_len = buf.len();
         let buf_rgn = FileRange::try_new(offset, offset + buf_len)?;
@@ -83,17 +75,17 @@ impl HotFile {
             .lock()
             .await
             .range((left_bnd, right_bnd))
-            .filter(|(rgn, _)| rgn.intersect(&buf_rgn).is_some())
-            .map(|(&rgn, buf)| (rgn, buf.clone()))
+            .filter_map(|(&rgn, buf)| {
+                (buf_rgn.contains(&rgn) || buf_rgn.intersect(&rgn).is_some())
+                    .then(|| (rgn, buf.clone()))
+            })
             .collect::<Vec<_>>();
-        let merged_start = overlapped
-            .iter()
-            .map(|(r, _)| r.start)
-            .fold(buf_rgn.start, |acc, s| acc.min(s));
-        let merged_end = overlapped
-            .iter()
-            .map(|(r, _)| r.end)
-            .fold(buf_rgn.end, |acc, e| acc.max(e));
+        let (merged_start, merged_end) = overlapped.iter().map(|(r, _)| r).fold(
+            (buf_rgn.start, buf_rgn.end),
+            |(acc_start, acc_end), FileRange { start, end }| {
+                (acc_start.min(*start), acc_end.max(*end))
+            },
+        );
         let merged_rgn = FileRange::new(merged_start, merged_end);
         let mut merged_buf = BytesMut::with_capacity(merged_rgn.interval());
         merged_buf.resize(merged_rgn.interval(), 0u8);
@@ -126,7 +118,7 @@ impl HotFile {
             .collect::<Vec<_>>();
         drop(dirty_guard);
         let mut disk_guard = self.disk.lock().await;
-        if disk_guard.metadata().await?.len() < target_len as u64 {
+        if likey(disk_guard.metadata().await?.len() < target_len as u64) {
             disk_guard.set_len(target_len as u64).await?;
         }
         for (rgn, buf) in &snapshot {
@@ -144,23 +136,15 @@ impl HotFile {
 
     async fn read_disk_by_range(&self, rgn: FileRange) -> Result<Bytes, HotFileError> {
         let logical_len = self.sync_len_state.load(Ordering::Relaxed);
-        if rgn.end > logical_len {
+        if unlikely(rgn.end > logical_len) {
             return Err(HotFileError::OutOfFile);
         }
-
         let mut disk_guard = self.disk.lock().await;
         let disk_len = disk_guard.metadata().await?.len() as usize;
-
-        // Calculate the actual part of the range that exists on disk
-        let read_start = rgn.start;
-        let read_end = disk_len.min(rgn.end);
-        let read_rgn = FileRange::new(read_start, read_end);
-
-        // Prepare buffer initialized with zeros
+        let read_rgn = FileRange::new(rgn.start, disk_len.min(rgn.end));
         let mut buf = BytesMut::with_capacity(rgn.interval());
         buf.resize(rgn.interval(), 0);
-
-        if read_rgn.interval() > 0 {
+        if likely(read_rgn.interval() > 0) {
             disk_guard
                 .seek(SeekFrom::Start(read_rgn.start as u64))
                 .await?;
@@ -168,33 +152,28 @@ impl HotFile {
                 .read_exact(&mut buf[0..read_rgn.interval()])
                 .await?;
         }
-
         Ok(buf.freeze())
     }
 
     pub async fn read(&self, mask: FileMultiRange) -> Result<Vec<Bytes>, HotFileError> {
         let mut rst = Vec::new();
+        let dirty_guard = self.dirty.lock().await;
         for sub_rgn in mask.as_ref() {
             let left_bnd = Bound::Unbounded;
             let right_bnd = Bound::Included(FileRange::new(sub_rgn.end, usize::MAX));
-            let dirty_segs = self
-                .dirty
-                .lock()
-                .await
+            let dirty_segs = dirty_guard
                 .range((left_bnd, right_bnd))
                 .filter_map(|(drt_rgn, seg)| {
                     sub_rgn
                         .intersect(drt_rgn)
-                        .map(|ovlp| (ovlp, seg.slice(ovlp.offset(drt_rgn.start).unwrap())))
+                        .map(|ovlp| (ovlp, seg.slice(ovlp.offset(drt_rgn.start, false).unwrap())))
                 })
                 .collect::<HashMap<_, _>>();
-
             let dirty_mask = FileMultiRange::try_from(
                 dirty_segs.keys().copied().collect::<Vec<_>>().as_slice(),
             )?;
             let sub_mask: FileMultiRange = (*sub_rgn).into();
             let disk_mask = sub_mask.subtract(&dirty_mask);
-            // 注意这里的迭代器顺序并不和需求一致
             let fut_iter = dirty_segs
                 .into_iter()
                 .map(|(rgn, data)| (rgn, BufferSource::Dirty(data)))
@@ -208,11 +187,12 @@ impl HotFile {
                         },
                     }
                 });
-            let chunk = try_join_all(fut_iter)
+            let mut chunk = try_join_all(fut_iter)
                 .await?
                 .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            rst.append(&mut chunk.values().cloned().collect()); // 可能会造成重复
+                .collect::<Vec<_>>();
+            chunk.sort_by_cached_key(|&(k, _)| k);
+            rst.append(&mut chunk.into_iter().map(|(_, v)| v).collect::<Vec<_>>());
         }
         Ok(rst)
     }
@@ -531,13 +511,13 @@ mod tests {
         // AB CDEF GHI JK L0000
         // 00 1234 000 zz 0000X
         let expected = vec![
-            Bytes::from_static(b"AB"),   // 0..2 from DISK
-            Bytes::from_static(b"1"),    // 2..3 from DIRTY
-            Bytes::from_static(b"4"),    // 5..6 from DIRTY
-            Bytes::from_static(b"GH"),  // 6..8 from DISK
-            Bytes::from_static(b"z"),    // 10..11 from DISK
-            Bytes::from_static(b"L\0\0\0"),    // 11..12 from DISK
-            Bytes::from_static(b"X"), // 12..16 from DIRTY
+            Bytes::from_static(b"AB"),      // 0..2 from DISK
+            Bytes::from_static(b"1"),       // 2..3 from DIRTY
+            Bytes::from_static(b"4"),       // 5..6 from DIRTY
+            Bytes::from_static(b"GH"),      // 6..8 from DISK
+            Bytes::from_static(b"z"),       // 10..11 from DISK
+            Bytes::from_static(b"L\0\0\0"), // 11..12 from DISK
+            Bytes::from_static(b"X"),       // 12..16 from DIRTY
         ];
 
         assert_eq!(result.len(), expected.len());
@@ -546,4 +526,3 @@ mod tests {
         }
     }
 }
-

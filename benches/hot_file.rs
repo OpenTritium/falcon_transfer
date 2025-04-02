@@ -1,13 +1,14 @@
 use bytes::Bytes;
-use criterion::{Criterion, criterion_group, criterion_main, BatchSize};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use falcon_transfer::hot_file::{FileMultiRange, HotFile};
 use rand::{Rng, rng};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, OnceLock};
 use tempfile::NamedTempFile;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 const KB: usize = 1024;
 const MB: usize = 1024 * KB;
@@ -43,9 +44,7 @@ fn bench_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("write");
     group.sample_size(10);
 
-    for size in [4 * KB, 256 * KB, 4 * MB].iter() {
-        let size = *size;
-
+    for size in [4 * KB, 256 * KB, 4 * MB].into_iter() {
         group.bench_with_input(format!("hotfile_{}KB", size / KB), &size, |b, &size| {
             b.to_async(rt()).iter_batched(
                 || prepare_file_sync(size, false),
@@ -78,7 +77,7 @@ fn bench_read(c: &mut Criterion) {
     group.sample_size(10);
 
     let scenarios = [
-        ("cached", false, 4 * KB),
+        ("fs-cached", false, 4 * KB),
         ("disk", true, 4 * KB),
         ("mixed", false, 4 * MB),
     ];
@@ -96,7 +95,8 @@ fn bench_read(c: &mut Criterion) {
                         let hot_file = HotFile::open_existed(&file).await.unwrap();
                         let mask = FileMultiRange::try_from([0..size].as_slice()).unwrap();
                         let result = hot_file.read(mask).await.unwrap();
-                        let received: Vec<u8> = result.iter().flat_map(|b| b.iter().cloned()).collect();
+                        let received: Vec<u8> =
+                            result.iter().flat_map(|b| b.iter().cloned()).collect();
                         assert_eq!(received, expected.as_ref());
                     },
                     BatchSize::SmallInput,
@@ -128,9 +128,7 @@ fn bench_concurrent(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent");
     group.sample_size(10);
 
-    for concurrency in [4, 16, 64].iter() {
-        let concurrency = *concurrency;
-
+    for concurrency in [4, 16, 64, 128].into_iter() {
         group.bench_with_input(
             format!("hotfile_{}_writers", concurrency),
             &concurrency,
@@ -163,15 +161,18 @@ fn bench_concurrent(c: &mut Criterion) {
             &concurrency,
             |b, &concurrency| {
                 b.to_async(rt()).iter_batched(
-                    || (0..concurrency).map(|_| NamedTempFile::new().unwrap()).collect::<Vec<_>>(),
-                    |files| async move {
+                    || async {
+                        let f = NamedTempFile::new().unwrap();
+                        Arc::new(Mutex::new(tokio::fs::File::create(&f).await.unwrap()))
+                    },
+                    |file| async move {
+                        let file = file.await;
                         let mut handles = Vec::with_capacity(concurrency);
-                        for file in files {
-                            let path = file.path().to_owned();
+                        for _ in 0..concurrency {
                             let data = random_data(4 * KB);
+                            let file = file.clone();
                             handles.push(tokio::spawn(async move {
-                                let mut handle = tokio::fs::File::create(&path).await.unwrap();
-                                handle.write_all(&data).await.unwrap();
+                                file.clone().lock().await.write_all(&data).await.unwrap();
                             }));
                         }
                         futures::future::join_all(handles).await;
