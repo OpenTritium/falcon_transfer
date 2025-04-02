@@ -63,3 +63,4 @@ impl Decoder for MsgCodec {
         Ok(Some(msg))
     }
 }
+// 支持到事件的直接解码
