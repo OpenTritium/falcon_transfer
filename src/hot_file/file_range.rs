@@ -31,9 +31,9 @@ impl FileRange {
         Self { start, end }
     }
     #[inline]
-    pub fn try_new(start: usize, end: usize) -> Result<Self,FileRangeError> {
+    pub fn try_new(start: usize, end: usize) -> Result<Self, FileRangeError> {
         likely(start < end)
-            .then(|| Self { start, end })
+            .then_some(Self { start, end })
             .ok_or_else(|| FileRangeError::InvalidRange {
                 start: Bound::Included(start),
                 end: Bound::Excluded(end),
@@ -54,15 +54,15 @@ impl FileRange {
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         let start = self.start.max(other.start);
         let end = self.end.min(other.end);
-        likely(start < end).then(|| Self { start, end })
+        likely(start < end).then_some(Self { start, end })
     }
 
     #[inline]
     pub fn union(&self, other: &Self) -> Option<Self> {
-        likely(self.end >= other.start && other.end >= self.start).then(|| Self {
-            start: self.start.min(other.start),
-            end: self.end.max(other.end),
-        })
+        likely(self.end >= other.start && other.end >= self.start).then_some(Self::new(
+            self.start.min(other.start),
+            self.end.max(other.end),
+        ))
     }
 
     #[inline]
@@ -75,14 +75,8 @@ impl FileRange {
         let b_start = intersection.start;
         let b_end = intersection.end;
         [
-            (a_start < b_start).then(|| FileRange {
-                start: a_start,
-                end: b_start,
-            }),
-            (a_end > b_end).then(|| FileRange {
-                start: b_end,
-                end: a_end,
-            }),
+            (a_start < b_start).then(|| Self::new(a_start, b_start)),
+            (a_end > b_end).then(|| Self::new(b_end, a_end)),
         ]
     }
 
@@ -92,11 +86,18 @@ impl FileRange {
     }
 
     #[inline]
-    pub fn offset(&self, offset: usize) -> Option<Self> {
-        (offset <= self.start).then_some(Self {
-            start: self.start - offset,
-            end: self.end - offset,
-        })
+    pub fn offset(&self, offset: usize, advanced: bool) -> Result<Self, FileRangeError> {
+        if likely(!advanced) {
+            (offset <= self.start)
+                .then_some(Self::new(self.start - offset, self.end - offset))
+                .ok_or(FileRangeError::IndexOverflow)
+        } else {
+            let end = self
+                .end
+                .checked_add(offset)
+                .ok_or(FileRangeError::IndexOverflow)?;
+            Ok(Self::new(self.start - offset, end))
+        }
     }
 }
 
@@ -262,6 +263,7 @@ impl FileMultiRange {
         }
     }
 
+    #[inline]
     pub fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
         let range = FileRange::try_new(start, end)?;
         if unlikely(self.inner.is_empty()) {
@@ -431,10 +433,7 @@ mod tests {
     #[test]
     fn edge_cases() {
         // 最小有效范围
-        assert_eq!(
-            FileRange::try_new(0, 1),
-            Ok(FileRange { start: 0, end: 1 })
-        );
+        assert_eq!(FileRange::try_new(0, 1), Ok(FileRange { start: 0, end: 1 }));
 
         // 最大值边界
         let max = usize::MAX;

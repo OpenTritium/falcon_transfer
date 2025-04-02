@@ -1,5 +1,5 @@
-use crate::utils::Msg;
 use super::{EndPoint, HandshakeState, Uid};
+use crate::utils::Msg;
 
 // 除了发现报文需要源地址与目标地址外，其他报文只需要uid就可以查表到可达链路
 #[derive(Debug)]
@@ -11,10 +11,7 @@ pub enum Event {
         local: EndPoint,
     },
     /// 后续的事件都是基于该链路已经发现的假设
-    Auth {
-        host_id: Uid,
-        state: HandshakeState,
-    },
+    Auth { host_id: Uid, state: HandshakeState },
     /// 你需要看看msg那边的注释
     Transfer {
         host_id: Uid,
@@ -28,7 +25,13 @@ impl From<(Msg, &EndPoint)> for Event {
     fn from(parcel: (Msg, &EndPoint)) -> Self {
         use Msg::*;
         match parcel {
-            (Discovery { host_id, remote: src }, local) => Event::Discovery {
+            (
+                Discovery {
+                    host_id,
+                    remote: src,
+                },
+                local,
+            ) => Event::Discovery {
                 remote: src,
                 host_id,
                 local: *local,
