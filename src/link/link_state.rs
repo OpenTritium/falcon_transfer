@@ -97,6 +97,13 @@ impl LinkState {
         // Higher metric means lower weight
         1_000_000 / (self.metric + 1)
     }
+    #[cfg(target_os = "linux")]
+    // 应当对不同系统有不一样的行为
+    pub fn weight(&self) -> u64 {
+        // Use inverse metric + 1 to avoid division by zero
+        // Higher metric means lower weight
+        1_000_000 / (self.metric + 1)
+    }
 
     // 分配链路后立刻调用
     pub fn update_usage(&self) {
