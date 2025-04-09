@@ -118,9 +118,25 @@ impl TryFrom<SocketAddrV6> for EndPoint {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
+
+    use crate::utils::addr::scoped_addr::tests::{mock_scoped_lan, mock_scoped_wan};
+
     use super::EndPoint;
 
+    pub fn mock_endpoint_lan() -> EndPoint {
+        EndPoint {
+            addr: mock_scoped_lan(),
+            port: 56,
+        }
+    }
+
+    pub fn mock_endpoint_wan() -> EndPoint {
+        EndPoint {
+            addr: mock_scoped_wan(),
+            port: 78,
+        }
+    }
     #[test]
     fn parse_valid() {
         vec![

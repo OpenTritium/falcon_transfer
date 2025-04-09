@@ -9,6 +9,7 @@
 #![feature(iter_next_chunk)]
 
 pub mod env;
+pub mod event_handler;
 pub mod hot_file;
 pub mod link;
 pub mod utils;

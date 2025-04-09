@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct Bond {
     pub links: IndexSet<Arc<LinkState>>,
-    flag: BondStateFlag, // 该状态描述bond状态而非link状态
+    pub flag: BondStateFlag, // 该状态描述bond状态而非link状态
 }
 
 impl Bond {

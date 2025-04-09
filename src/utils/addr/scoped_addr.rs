@@ -93,9 +93,34 @@ impl From<ScopedAddr> for std::net::IpAddr {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use anyhow::Result;
+    use rand::Rng;
+
+    pub fn mock_scoped_lan() -> ScopedAddr {
+        let mut rng = rand::rng();
+        let p0: u16 = rng.random_range(0..=0xFFFF);
+        let p1: u16 = rng.random_range(0..=0xFFFF);
+        let p2: u16 = rng.random_range(0..=0xFFFF);
+        let p3: u16 = rng.random_range(0..=0xFFFF);
+        let addr = RawIpv6Addr::new(0xFE80, 0, 0, 0, p0, p1, p2, p3);
+        (addr, 17).try_into().unwrap()
+    }
+
+    pub fn mock_scoped_wan() -> ScopedAddr {
+        let mut rng = rand::rng();
+        let p0: u16 = rng.random_range(0..=0xFFFF);
+        let p1: u16 = rng.random_range(0..=0xFFFF);
+        let p2: u16 = rng.random_range(0..=0xFFFF);
+        let p3: u16 = rng.random_range(0..=0xFFFF);
+        let p4: u16 = rng.random_range(0..=0xFFFF);
+        let p5: u16 = rng.random_range(0..=0xFFFF);
+        let p6: u16 = rng.random_range(0..=0xFFFF);
+        let addr = RawIpv6Addr::new(0x240e, p0, p1, p2, p3, p4, p5, p6);
+        addr.try_into().unwrap()
+    }
+
     const LAN_IP: &str = "fe80::ddf:a82c:b441:d088";
     const WAN_IP: &str = "240e:430:123b:79d8:cf61:9682:3589:64e6";
     #[test]
@@ -177,7 +202,7 @@ mod tests {
         assert_eq!(addr, expected);
         Ok(())
     }
-    
+
     #[test]
     #[should_panic]
     fn parse_invalid_str() {

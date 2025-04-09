@@ -13,7 +13,7 @@ use tracing::{error, info};
 
 pub type Metric = u64;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum LinkError {
     #[error("No healthy links available")]
     LinksNotFound,
@@ -82,7 +82,6 @@ impl LinkState {
     }
 
     pub fn reset(&self) {
-        self.failure_count.store(0, Ordering::Release);
         self.is_healthy.store(true, Ordering::Release);
         info!(
             "Link: {} -> {} recovered",
@@ -135,6 +134,10 @@ impl LinkState {
                 }
             }),
         ))
+    }
+
+    pub fn addr(&self) -> (EndPoint, EndPoint) {
+        (self.addr_local, self.addr_remote)
     }
 }
 
@@ -218,6 +221,6 @@ mod test {
         assert_eq!(link.failure_count.load(Ordering::Acquire), 1);
         (task.callback)();
         assert_eq!(link.is_healthy.load(Ordering::Acquire), true);
-        assert_eq!(link.failure_count.load(Ordering::Acquire), 0);
+        assert_eq!(link.failure_count.load(Ordering::Acquire), 1);
     }
 }

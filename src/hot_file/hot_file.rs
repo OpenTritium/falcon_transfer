@@ -142,7 +142,6 @@ impl HotFile {
         let mut disk_guard = self.disk.lock().await;
         let disk_len = disk_guard.metadata().await?.len() as usize;
         let read_rgn = FileRange::new(rgn.start, disk_len.min(rgn.end));
-        let read_rgn = FileRange::new(rgn.start, disk_len.min(rgn.end));
         let mut buf = BytesMut::with_capacity(rgn.interval());
         buf.resize(rgn.interval(), 0);
         if likely(read_rgn.interval() > 0) {
@@ -221,7 +220,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
-    async fn test_create_new_file() {
+    async fn create_new_file() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("new_file");
 
@@ -236,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_merge() {
+    async fn write_merge() {
         let temp_dir = tempdir().unwrap();
         let hot_file = HotFile::open_new(temp_dir.path().join("merge_test"))
             .await
@@ -259,7 +258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_to_disk() {
+    async fn sync_to_disk() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("sync_test");
 
@@ -280,16 +279,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_combination() {
+    async fn read_combination() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("read_test");
 
         // 初始化磁盘数据
-        {
-            let mut file = File::create(&file_path).await.unwrap();
-            file.write_all(b"ABCDEFGHIJKL").await.unwrap();
-            // ABCDEFGHIJKL
-        }
+
+        let mut file = File::create(&file_path).await.unwrap();
+        file.write_all(b"ABCDEFGHIJKL").await.unwrap();
+        // ABCDEFGHIJKL
 
         let hot_file = HotFile::open_existed(&file_path).await.unwrap();
 
@@ -323,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complex_merge() {
+    async fn complex_merge() {
         let temp_dir = tempdir().unwrap();
         let hot_file = HotFile::open_new(temp_dir.path().join("complex_merge"))
             .await
@@ -355,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_full_overlap() {
+    async fn write_full_overlap() {
         let temp_dir = tempdir().unwrap();
         let hot_file = HotFile::open_new(temp_dir.path().join("full_overlap"))
             .await
@@ -374,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_beyond_file_length() {
+    async fn read_beyond_file_length() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("read_beyond");
 
@@ -393,7 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_write() {
+    async fn concurrent_write() {
         let temp_dir = tempdir().unwrap();
         let hot_file = std::sync::Arc::new(
             HotFile::open_new(temp_dir.path().join("concurrent_write"))
@@ -421,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_calculation() {
+    async fn hash_calculation() {
         let temp_dir = tempdir().unwrap();
         let hot_file = HotFile::open_new(temp_dir.path().join("hash_test"))
             .await
@@ -445,7 +443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_syncs() {
+    async fn multiple_syncs() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("multiple_syncs");
 
@@ -474,7 +472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_zero_length() {
+    async fn write_zero_length() {
         let temp_dir = tempdir().unwrap();
         let hot_file = HotFile::open_new(temp_dir.path().join("zero_length"))
             .await
@@ -483,14 +481,12 @@ mod tests {
         // 尝试写入0字节
         let _ = hot_file.write(Bytes::new(), 0).await;
 
-        {
-            let dirty = hot_file.dirty.lock().await;
-            assert!(dirty.is_empty(), "0长度写入不应产生脏数据");
-        }
+        let dirty = hot_file.dirty.lock().await;
+        assert!(dirty.is_empty(), "0长度写入不应产生脏数据");
     }
 
     #[tokio::test]
-    async fn test_read_complex_ranges() {
+    async fn read_complex_ranges() {
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("complex_ranges");
 

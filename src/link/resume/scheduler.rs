@@ -12,7 +12,12 @@ use tokio_util::time::DelayQueue;
 pub enum ResumeTaskError {
     #[error(transparent)]
     TaskSendError(#[from] TrySendError<ResumeTask>),
+    #[error("the arc refference of this link is invalid for now")]
+    LinkRefInvalid,
 }
+
+unsafe impl Send for ResumeTaskError {}
+unsafe impl Sync for ResumeTaskError {}
 
 pub struct ResumeScheduler {
     abort: AbortHandle,
