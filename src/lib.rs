@@ -7,9 +7,11 @@
 #![feature(likely_unlikely)]
 #![feature(portable_simd)]
 #![feature(iter_next_chunk)]
+#![feature(ip_from)]
 
 pub mod env;
 pub mod event_handler;
 pub mod hot_file;
+pub mod iface;
 pub mod link;
 pub mod utils;

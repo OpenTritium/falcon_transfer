@@ -1,10 +1,11 @@
 mod assigned;
 mod bond;
-mod link_state;
-mod table;
-mod resume;
 mod flag;
+mod link_state;
+mod resume;
+mod table;
 
+pub use flag::BondStateFlag;
 pub use link_state::*;
 pub use resume::*;
-pub use flag::BondStateFlag;
+pub use table::*;
