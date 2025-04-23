@@ -1,11 +1,13 @@
-use super::NicView;
+use super::{MsgCodec, NetworkMsg, NicView};
 use crate::{
-    env::{MsgCodec, global_config},
-    utils::{EndPoint, Msg, RawIpv6Addr},
+    addr::{EndPoint, RawIpv6Addr},
+    config::global_config,
 };
+
 use anyhow::Result;
 use futures::{
     StreamExt,
+    future::try_join_all,
     stream::{SelectAll, SplitSink, SplitStream},
 };
 use std::{collections::HashMap, net::SocketAddr};
@@ -25,29 +27,23 @@ async fn create_socket(addr: &EndPoint) -> Result<UdpSocket> {
     Ok(sock)
 }
 
-pub type MsgSink = SplitSink<UdpFramed<MsgCodec>, (Msg, SocketAddr)>;
-pub type MsgStream = SplitStream<UdpFramed<MsgCodec>>;
-pub type MsgSinkMap = HashMap<EndPoint, MsgSink>;
-pub type MsgStreamMux = SelectAll<MsgStream>;
+pub type NetworkMsgSink = SplitSink<UdpFramed<MsgCodec>, (NetworkMsg, SocketAddr)>;
+pub type NetworkMsgStream = SplitStream<UdpFramed<MsgCodec>>;
+pub type NetworkMsgSinkMap = HashMap<EndPoint, NetworkMsgSink>;
+pub type NetworkMsgStreamMux = SelectAll<NetworkMsgStream>;
 
-pub async fn split_group() -> Result<(MsgSinkMap, MsgStreamMux)> {
-    let rsts =
-        futures::future::try_join_all(NicView::default().map(async move |iface| -> Result<_> {
-            let addr = EndPoint::new(iface, global_config().protocol_port);
-            let sock = create_socket(&addr).await?;
-            Ok((addr, UdpFramed::new(sock, MsgCodec).split()))
-        }))
-        .await?;
-    // 分离sink和stream到不同集合
-    let mut sinks = HashMap::with_capacity(rsts.len());
+pub async fn split_group() -> Result<(NetworkMsgSinkMap, NetworkMsgStreamMux)> {
+    let results = try_join_all(NicView::default().map(async move |iface| -> Result<_> {
+        let addr = EndPoint::new(iface, global_config().protocol_port);
+        let sock = create_socket(&addr).await?;
+        Ok((addr, UdpFramed::new(sock, MsgCodec).split()))
+    }))
+    .await?;
+    let mut sinks = HashMap::with_capacity(results.len());
     let mut streams = SelectAll::new();
-    for (addr, (sink, stream)) in rsts {
+    for (addr, (sink, stream)) in results {
         sinks.insert(addr, sink);
         streams.push(stream);
     }
     Ok((sinks, streams))
 }
-// 遍历所有网络接口，然后创建socket
-// 将socket分离为 sink 和 stream
-// 将sink放在map中，然后通过dispatch分流
-// 将stream 直接聚合到同一个消息通道

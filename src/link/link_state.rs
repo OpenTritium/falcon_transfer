@@ -1,5 +1,5 @@
-use super::ResumeTask;
-use crate::utils::EndPoint;
+use super::LinkResumeTask;
+use crate::addr::EndPoint;
 use std::hash::Hash;
 use std::{
     sync::{
@@ -113,7 +113,7 @@ impl LinkState {
         self.last_used.store(now, Ordering::Relaxed);
     }
 
-    pub fn deacitve(self: Arc<Self>) -> Option<ResumeTask> {
+    pub fn deacitve(self: Arc<Self>) -> Option<LinkResumeTask> {
         // 记录错误次数，将链路标记为不健康
         // relaxed 足矣，马上有release同步
         let failure_count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -126,7 +126,7 @@ impl LinkState {
             _ => return None, // 当链路状态返回无的时候，链路状态表drop它
         };
         let link = Arc::downgrade(&self);
-        Some(ResumeTask::new(
+        Some(LinkResumeTask::new(
             delay,
             Box::new(move || {
                 if let Some(link) = link.upgrade() {
@@ -136,15 +136,16 @@ impl LinkState {
         ))
     }
 
-    pub fn addr(&self) -> (EndPoint, EndPoint) {
+    pub fn local_remote_addr(&self) -> (EndPoint, EndPoint) {
         (self.addr_local, self.addr_remote)
     }
 }
 
 #[cfg(test)]
 mod test {
+    use crate::addr::EndPoint;
+
     use super::LinkState;
-    use crate::utils::EndPoint;
     use std::{
         hash::{DefaultHasher, Hash, Hasher},
         sync::{Arc, OnceLock, atomic::Ordering},

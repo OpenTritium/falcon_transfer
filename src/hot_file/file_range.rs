@@ -2,7 +2,7 @@ use smallvec::{SmallVec, smallvec};
 use std::{
     cmp::Ordering,
     hint::{likely, unlikely},
-    ops::{Bound, Range, RangeBounds, RangeInclusive},
+    ops::{Bound, Deref, Range, RangeBounds, RangeInclusive},
 };
 use thiserror::Error;
 
@@ -21,8 +21,8 @@ pub enum FileRangeError {
 
 #[derive(Debug, PartialEq, Clone, Hash, Copy, Eq)]
 pub struct FileRange {
-    pub start: usize,
-    pub end: usize,
+    start: usize,
+    end: usize,
 }
 
 impl FileRange {
@@ -38,6 +38,16 @@ impl FileRange {
                 start: Bound::Included(start),
                 end: Bound::Excluded(end),
             })
+    }
+
+    #[inline]
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    #[inline]
+    pub fn end(&self) -> usize {
+        self.end
     }
 
     #[inline]
@@ -252,7 +262,23 @@ pub type StackBufferedFileRanges = SmallVec<[FileRange; STACK_BUFFERED_SIZE]>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileMultiRange {
-    pub inner: StackBufferedFileRanges,
+    inner: StackBufferedFileRanges,
+}
+
+impl Deref for FileMultiRange {
+    type Target = StackBufferedFileRanges;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Default for FileMultiRange {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileMultiRange {
@@ -264,11 +290,9 @@ impl FileMultiRange {
     }
 
     #[inline]
-    pub fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
-        let range = FileRange::try_new(start, end)?;
+    pub fn add(&mut self, range: FileRange) {
         if unlikely(self.inner.is_empty()) {
             self.inner.push(range);
-            return Ok(());
         }
         let left = self.inner.partition_point(|r| r.end < range.start);
         let right = self.inner.partition_point(|r| r.start <= range.end);
@@ -288,6 +312,12 @@ impl FileMultiRange {
                 self.inner.insert(left, range);
             }
         }
+    }
+
+    #[inline]
+    pub fn add_checked(&mut self, start: usize, end: usize) -> Result<(), FileRangeError> {
+        let range = FileRange::try_new(start, end)?;
+        self.add(range);
         Ok(())
     }
 
@@ -350,6 +380,33 @@ impl FileMultiRange {
             }
         }
         result
+    }
+
+    #[inline]
+    pub fn split(&self, n: usize) -> impl Iterator<Item = Result<FileRange, FileRangeError>> + '_ {
+        self.inner.iter().flat_map(move |range| {
+            let start = range.start;
+            let end = range.end;
+            let mut current = start;
+            std::iter::from_fn(move || {
+                if unlikely(current >= end) {
+                    return None;
+                }
+                if unlikely(n == 0) {
+                    let result = FileRange::new(current, end);
+                    current = end;
+                    return Some(Ok(result));
+                }
+                let next = match current.checked_add(n) {
+                    Some(n) => n,
+                    None => return Some(Err(FileRangeError::IndexOverflow)),
+                };
+                let slice_end = next.min(end);
+                let result = FileRange::new(current, slice_end);
+                current = slice_end;
+                Some(Ok(result))
+            })
+        })
     }
 
     #[inline]

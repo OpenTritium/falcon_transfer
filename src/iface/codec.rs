@@ -1,5 +1,5 @@
-use crate::env::global_config;
-use crate::utils::Msg;
+use super::NetworkMsg;
+use crate::config::global_config;
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::warn;
@@ -12,9 +12,9 @@ impl MsgCodec {
     const MSG_MAX_LEN: usize = 9999; // todo
 }
 
-impl Encoder<Msg> for MsgCodec {
+impl Encoder<NetworkMsg> for MsgCodec {
     type Error = anyhow::Error;
-    fn encode(&mut self, item: Msg, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: NetworkMsg, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let mut msg_buf = vec![]; // todo 内存分配优化
         let msg_len = bincode::encode_into_slice(item, &mut msg_buf, bincode::config::standard())?;
         dst.extend(
@@ -30,7 +30,7 @@ impl Encoder<Msg> for MsgCodec {
 }
 
 impl Decoder for MsgCodec {
-    type Item = Msg;
+    type Item = NetworkMsg;
     type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -56,11 +56,10 @@ impl Decoder for MsgCodec {
             src.advance(msg_len);
             return Ok(None);
         }
-        let (msg, _) = bincode::decode_from_slice::<Msg, _>(
+        let (msg, _) = bincode::decode_from_slice::<NetworkMsg, _>(
             &src.split_to(msg_len)[Self::HEADER_LEN..],
             bincode::config::standard(),
         )?;
         Ok(Some(msg))
     }
 }
-// 支持到事件的直接解码

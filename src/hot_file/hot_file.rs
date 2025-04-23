@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hasher;
 use std::hint::{likely, unlikely};
 use std::io::SeekFrom;
-use std::ops::Bound;
+use std::ops::{Bound, Deref};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::usize;
@@ -35,7 +35,7 @@ pub struct HotFile {
 }
 
 impl HotFile {
-    pub async fn open_new<P: AsRef<Path>>(path: P) -> IoResult<Self> {
+    pub async fn open_new<P: AsRef<Path>>(path: P) -> Result<Self, HotFileError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -50,7 +50,7 @@ impl HotFile {
         })
     }
 
-    pub async fn open_existed<P: AsRef<Path>>(path: P) -> IoResult<Self> {
+    pub async fn open_existed<P: AsRef<Path>>(path: P) -> Result<Self, HotFileError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -65,11 +65,11 @@ impl HotFile {
         })
     }
 
-    pub async fn write(&self, buf: Bytes, offset: Offset) -> Result<(), HotFileError> {
+    pub async fn write(&self, buf: &[u8], offset: Offset) -> Result<(), HotFileError> {
         let buf_len = buf.len();
         let buf_rgn = FileRange::try_new(offset, offset + buf_len)?;
         let left_bnd = Bound::Unbounded;
-        let right_bnd = Bound::Included(FileRange::new(buf_rgn.end, usize::MAX));
+        let right_bnd = Bound::Included(FileRange::new(buf_rgn.end(), usize::MAX));
         let overlapped = self
             .dirty
             .lock()
@@ -81,21 +81,22 @@ impl HotFile {
             })
             .collect::<Vec<_>>();
         let (merged_start, merged_end) = overlapped.iter().map(|(r, _)| r).fold(
-            (buf_rgn.start, buf_rgn.end),
-            |(acc_start, acc_end), FileRange { start, end }| {
-                (acc_start.min(*start), acc_end.max(*end))
+            (buf_rgn.start(), buf_rgn.end()),
+            |(acc_start, acc_end), rng| {
+                let (start, end) = rng.pair();
+                (acc_start.min(start), acc_end.max(end))
             },
         );
         let merged_rgn = FileRange::new(merged_start, merged_end);
         let mut merged_buf = BytesMut::with_capacity(merged_rgn.interval());
         merged_buf.resize(merged_rgn.interval(), 0u8);
         for (rgn, buf) in &overlapped {
-            let merged_start = rgn.start - merged_start;
+            let merged_start = rgn.start() - merged_start;
             let merged_end = merged_start + rgn.interval();
             merged_buf[merged_start..merged_end].copy_from_slice(buf);
         }
         self.sync_len_state
-            .fetch_max(merged_rgn.end, Ordering::Relaxed);
+            .fetch_max(merged_rgn.end(), Ordering::Relaxed);
         let merged_start = offset - merged_start;
         merged_buf[merged_start..merged_start + buf_len].copy_from_slice(&buf);
         let mut dirty_guard = self.dirty.lock().await;
@@ -122,7 +123,7 @@ impl HotFile {
             disk_guard.set_len(target_len as u64).await?;
         }
         for (rgn, buf) in &snapshot {
-            disk_guard.seek(SeekFrom::Start(rgn.start as u64)).await?;
+            disk_guard.seek(SeekFrom::Start(rgn.start() as u64)).await?;
             disk_guard.write_all(buf).await?;
         }
         disk_guard.sync_all().await?;
@@ -136,17 +137,17 @@ impl HotFile {
 
     async fn read_disk_by_range(&self, rgn: FileRange) -> Result<Bytes, HotFileError> {
         let logical_len = self.sync_len_state.load(Ordering::Relaxed);
-        if unlikely(rgn.end > logical_len) {
+        if unlikely(rgn.end() > logical_len) {
             return Err(HotFileError::OutOfFile);
         }
         let mut disk_guard = self.disk.lock().await;
         let disk_len = disk_guard.metadata().await?.len() as usize;
-        let read_rgn = FileRange::new(rgn.start, disk_len.min(rgn.end));
+        let read_rgn = FileRange::new(rgn.start(), disk_len.min(rgn.end()));
         let mut buf = BytesMut::with_capacity(rgn.interval());
         buf.resize(rgn.interval(), 0);
         if likely(read_rgn.interval() > 0) {
             disk_guard
-                .seek(SeekFrom::Start(read_rgn.start as u64))
+                .seek(SeekFrom::Start(read_rgn.start() as u64))
                 .await?;
             disk_guard
                 .read_exact(&mut buf[0..read_rgn.interval()])
@@ -160,13 +161,16 @@ impl HotFile {
         let dirty_guard = self.dirty.lock().await;
         for sub_rgn in mask.as_ref() {
             let left_bnd = Bound::Unbounded;
-            let right_bnd = Bound::Included(FileRange::new(sub_rgn.end, usize::MAX));
+            let right_bnd = Bound::Included(FileRange::new(sub_rgn.end(), usize::MAX));
             let dirty_segs = dirty_guard
                 .range((left_bnd, right_bnd))
                 .filter_map(|(drt_rgn, seg)| {
-                    sub_rgn
-                        .intersect(drt_rgn)
-                        .map(|ovlp| (ovlp, seg.slice(ovlp.offset(drt_rgn.start, false).unwrap())))
+                    sub_rgn.intersect(drt_rgn).map(|ovlp| {
+                        (
+                            ovlp,
+                            seg.slice(ovlp.offset(drt_rgn.start(), false).unwrap()),
+                        )
+                    })
                 })
                 .collect::<HashMap<_, _>>();
             let dirty_mask = FileMultiRange::try_from(
@@ -177,7 +181,12 @@ impl HotFile {
             let fut_iter = dirty_segs
                 .into_iter()
                 .map(|(rgn, data)| (rgn, BufferSource::Dirty(data)))
-                .chain(disk_mask.inner.iter().map(|rgn| (*rgn, BufferSource::Disk)))
+                .chain(
+                    disk_mask
+                        .deref()
+                        .iter()
+                        .map(|rgn| (*rgn, BufferSource::Disk)),
+                )
                 .map(|(rgn, src)| async move {
                     match src {
                         BufferSource::Dirty(buf) => Ok((rgn, buf)),
@@ -197,12 +206,17 @@ impl HotFile {
         Ok(rst)
     }
 
-    async fn hash(&self, buf_chunk: &[impl AsRef<[u8]>]) -> IoResult<u64> {
+    // todo 重整约束
+    pub fn hash<I, B>(chunks: I) -> u64
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
         let mut hasher = Xxh3::new();
-        for buf in buf_chunk {
-            hasher.update(buf.as_ref());
+        for chunk in chunks {
+            hasher.update(chunk.as_ref());
         }
-        Ok(hasher.finish())
+        hasher.finish()
     }
 }
 
@@ -210,6 +224,18 @@ impl HotFile {
 enum BufferSource {
     Dirty(Bytes),
     Disk,
+}
+
+pub fn arrange_bytes_to_vec<I, B>(bytes_iter: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = B> + ExactSizeIterator,
+    B: AsRef<[u8]>,
+{
+    let mut result = Vec::with_capacity(bytes_iter.len());
+    for bytes in bytes_iter {
+        result.extend_from_slice(bytes.as_ref());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -242,14 +268,14 @@ mod tests {
             .unwrap();
 
         // 写入不重叠区域
-        let _ = hot_file.write(Bytes::from("hello"), 0).await; // 0..5
-        let _ = hot_file.write(Bytes::from("world"), 10).await; // 10..15
+        let _ = hot_file.write(b"hello", 0).await; // 0..5
+        let _ = hot_file.write(b"world", 10).await; // 10..15
         let dirty = hot_file.dirty.lock().await;
         assert_eq!(dirty.len(), 2);
         drop(dirty);
 
         // 写入重叠区域
-        let _ = hot_file.write(Bytes::from("XXXX"), 8).await; // 8..12
+        let _ = hot_file.write(b"XXXX", 8).await; // 8..12
 
         let dirty = hot_file.dirty.lock().await;
         assert_eq!(dirty.len(), 2);
@@ -265,7 +291,7 @@ mod tests {
         let hot_file = HotFile::open_new(&file_path).await.unwrap();
 
         // 写入并同步
-        let _ = hot_file.write(Bytes::from("test data"), 0).await;
+        let _ = hot_file.write(b"test data", 0).await;
         hot_file.sync().await.unwrap();
 
         // 验证磁盘内容
@@ -292,9 +318,9 @@ mod tests {
         let hot_file = HotFile::open_existed(&file_path).await.unwrap();
 
         // 写入部分缓存
-        let _ = hot_file.write(Bytes::from("1234"), 2).await; //2..6
+        let _ = hot_file.write(b"1234", 2).await; //2..6
         //AB1234GHIJKL
-        let _ = hot_file.write(Bytes::from("zz"), 9).await; //9..11
+        let _ = hot_file.write(b"zz", 9).await; //9..11
         //AB1234GHIzzL
 
         // 构建读取范围: 0-12
@@ -328,17 +354,17 @@ mod tests {
             .unwrap();
 
         // 初始写入
-        let _ = hot_file.write(Bytes::from("hello"), 0).await; // 0..5
-        let _ = hot_file.write(Bytes::from("world"), 3).await; // 3..8
-        let _ = hot_file.write(Bytes::from("rust"), 7).await; // 7..11
+        let _ = hot_file.write(b"hello", 0).await; // 0..5
+        let _ = hot_file.write(b"world", 3).await; // 3..8
+        let _ = hot_file.write(b"rust", 7).await; // 7..11
 
         // 验证合并结果
 
         let dirty = hot_file.dirty.lock().await;
         assert_eq!(dirty.len(), 1);
         let (range, data) = dirty.iter().next().unwrap();
-        assert_eq!(range.start, 0);
-        assert_eq!(range.end, 11);
+        assert_eq!(range.start(), 0);
+        assert_eq!(range.end(), 11);
         assert_eq!(data.as_ref(), b"helworlrust");
         drop(dirty);
 
@@ -360,9 +386,9 @@ mod tests {
             .unwrap();
 
         // 初始写入 0..5
-        let _ = hot_file.write(Bytes::from("hello"), 0).await;
+        let _ = hot_file.write(b"hello", 0).await;
         // 完全覆盖写入 0..5
-        let _ = hot_file.write(Bytes::from("world"), 0).await;
+        let _ = hot_file.write(b"world", 0).await;
 
         let dirty = hot_file.dirty.lock().await;
         assert_eq!(dirty.len(), 1);
@@ -378,7 +404,7 @@ mod tests {
 
         // 初始文件内容为5字节 "hello"
         let hot_file = HotFile::open_new(&file_path).await.unwrap();
-        let _ = hot_file.write(Bytes::from("hello"), 0).await;
+        let _ = hot_file.write(b"hello", 0).await;
         hot_file.sync().await.unwrap();
 
         // 尝试读取 0..10 (超过文件长度)
@@ -404,7 +430,7 @@ mod tests {
                 let hot_file = hot_file.clone();
                 tokio::spawn(async move {
                     let _ = hot_file
-                        .write(Bytes::from(format!("block{}", i)), i * 10)
+                        .write(format!("block{}", i).as_bytes(), i * 10)
                         .await;
                 })
             })
@@ -420,16 +446,11 @@ mod tests {
 
     #[tokio::test]
     async fn hash_calculation() {
-        let temp_dir = tempdir().unwrap();
-        let hot_file = HotFile::open_new(temp_dir.path().join("hash_test"))
-            .await
-            .unwrap();
-
-        let data1 = Bytes::from("hello");
-        let data2 = Bytes::from("world");
-        let hash1 = hot_file.hash(&[&data1]).await.unwrap();
-        let hash2 = hot_file.hash(&[&data2]).await.unwrap();
-        let hash_combined = hot_file.hash(&[&data1, &data2]).await.unwrap();
+        let data1 = b"hello";
+        let data2 = b"world";
+        let hash1 = HotFile::hash(&[&data1]);
+        let hash2 = HotFile::hash(&[&data2]);
+        let hash_combined = HotFile::hash(&[&data1, &data2]);
 
         let mut hasher = Xxh3::new();
         hasher.update(b"hello");
@@ -450,7 +471,7 @@ mod tests {
         let hot_file = HotFile::open_new(&file_path).await.unwrap();
 
         // 第一次写入和同步
-        let _ = hot_file.write(Bytes::from("test1"), 0).await;
+        let _ = hot_file.write(b"test1", 0).await;
         hot_file.sync().await.unwrap();
 
         // 验证第一次同步
@@ -460,7 +481,7 @@ mod tests {
         assert_eq!(contents, b"test1");
 
         // 第二次写入和同步
-        let _ = hot_file.write(Bytes::from("test2"), 5).await;
+        let _ = hot_file.write(b"test2", 5).await;
         hot_file.sync().await.unwrap();
 
         // 验证第二次同步
@@ -479,7 +500,7 @@ mod tests {
             .unwrap();
 
         // 尝试写入0字节
-        let _ = hot_file.write(Bytes::new(), 0).await;
+        let _ = hot_file.write(&[], 0).await;
 
         let dirty = hot_file.dirty.lock().await;
         assert!(dirty.is_empty(), "0长度写入不应产生脏数据");
@@ -492,13 +513,13 @@ mod tests {
 
         // 初始化文件内容: 0..12 = "ABCDEFGHIJKL"
         let hot_file = HotFile::open_new(&file_path).await.unwrap();
-        let _ = hot_file.write(Bytes::from("ABCDEFGHIJKL"), 0).await;
+        let _ = hot_file.write(b"ABCDEFGHIJKL", 0).await;
         hot_file.sync().await.unwrap();
 
         // 写入多个脏数据块
-        let _ = hot_file.write(Bytes::from("1234"), 2).await; // 2..6
-        let _ = hot_file.write(Bytes::from("zz"), 9).await; // 9..11
-        let _ = hot_file.write(Bytes::from("X"), 15).await; // 15..16
+        let _ = hot_file.write(b"1234", 2).await; // 2..6
+        let _ = hot_file.write(b"zz", 9).await; // 9..11
+        let _ = hot_file.write(b"X", 15).await; // 15..16
 
         // 构建复杂读取范围：0..3, 5..8, 10..16
         let mask = FileMultiRange::try_from([0..3, 5..8, 10..16].as_slice()).unwrap();

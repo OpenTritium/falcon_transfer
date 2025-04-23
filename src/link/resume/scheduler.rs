@@ -1,4 +1,4 @@
-use super::task::ResumeTask;
+use super::task::LinkResumeTask;
 use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -7,25 +7,26 @@ use tokio::{
     task::AbortHandle,
 };
 use tokio_util::time::DelayQueue;
+use tracing::info;
 
 #[derive(Debug, Error)]
-pub enum ResumeTaskError {
+pub enum LinkResumeTaskError {
     #[error(transparent)]
-    TaskSendError(#[from] TrySendError<ResumeTask>),
+    TaskSendError(#[from] TrySendError<LinkResumeTask>),
     #[error("the arc refference of this link is invalid for now")]
     LinkRefInvalid,
 }
 
-unsafe impl Send for ResumeTaskError {}
-unsafe impl Sync for ResumeTaskError {}
+unsafe impl Sync for LinkResumeTaskError {}
+unsafe impl Send for LinkResumeTaskError {}
 
-pub struct ResumeScheduler {
+pub struct LinkResumeScheduler {
     abort: AbortHandle,
 }
 
-impl ResumeScheduler {
-    pub fn run() -> (Self, Sender<ResumeTask>) {
-        let (tx, mut rx) = channel::<ResumeTask>(128); // todo 认真考虑背压
+impl LinkResumeScheduler {
+    pub fn run() -> (Self, Sender<LinkResumeTask>) {
+        let (tx, mut rx) = channel::<LinkResumeTask>(128); // todo 认真考虑背压
         let abort = tokio::spawn(async move {
             let mut delay_queue = DelayQueue::new();
             loop {
@@ -45,8 +46,9 @@ impl ResumeScheduler {
     }
 }
 
-impl Drop for ResumeScheduler {
+impl Drop for LinkResumeScheduler {
     fn drop(&mut self) {
         self.abort.abort();
+        info!("Link Resume Scheduler has been dropped")
     }
 }

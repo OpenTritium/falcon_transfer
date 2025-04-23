@@ -33,6 +33,8 @@ indexmap = "2.7.1"
 xxhash-rust = {version= "0.8.15",features=["xxh3"]}
 smallvec = "1.14.0"
 object-pool = "0.6.0"
+tokio-stream = "0.1.17"
+teloc = "0.2.0"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }

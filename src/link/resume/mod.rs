@@ -15,10 +15,10 @@ mod tests {
     use tokio::task::yield_now;
     #[tokio::test(start_paused = true)]
     async fn link_resume() {
-        let (scheduler, task_sender) = ResumeScheduler::run();
+        let (scheduler, task_sender) = LinkResumeScheduler::run();
         let shared_state = Arc::new(AtomicBool::new(false));
         let shared_state_clone = shared_state.clone();
-        let task = ResumeTask::new(
+        let task = LinkResumeTask::new(
             Duration::from_secs(3),
             Box::new(move || {
                 shared_state_clone.store(true, Ordering::Release);

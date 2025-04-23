@@ -1,23 +1,29 @@
+use super::LinkResumeTaskError;
+use crate::addr::EndPoint;
+use crate::iface::HostId;
 use crate::link::assigned::AssignedLink;
 use crate::link::bond::Bond;
-use crate::link::{ResumeScheduler, ResumeTask};
-use crate::{link::link_state::LinkError, utils::EndPoint, utils::HostId};
+use crate::link::link_state::LinkError;
+use crate::link::{LinkResumeScheduler, LinkResumeTask};
 use dashmap::DashMap;
 use rand::Rng;
+use std::sync::OnceLock;
 use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::mpsc::Sender;
 
-use super::ResumeTaskError;
-
+static LINK_STATE_TABLE: OnceLock<LinkStateTable> = OnceLock::new();
+pub fn link_state_table() -> &'static LinkStateTable {
+    LINK_STATE_TABLE.get_or_init(LinkStateTable::new)
+}
 pub struct LinkStateTable {
     links: Arc<DashMap<HostId, Bond>>,
-    scheduler: ResumeScheduler,
-    delay_task_sender: Sender<ResumeTask>,
+    scheduler: LinkResumeScheduler,
+    delay_task_sender: Sender<LinkResumeTask>,
 }
 
 impl LinkStateTable {
     pub fn new() -> Self {
-        let (scheduler, delay_task_sender) = ResumeScheduler::run();
+        let (scheduler, delay_task_sender) = LinkResumeScheduler::run();
         LinkStateTable {
             links: Arc::new(DashMap::new()),
             scheduler,
@@ -31,7 +37,7 @@ impl LinkStateTable {
             .and_modify(|bond| {
                 bond.update(*local, *remote);
             })
-            .or_insert_with(|| Bond::new(*local, *remote));
+            .or_insert_with(|| Bond::new(local, remote));
     }
     //metric 加权
     // todo 重写
@@ -73,7 +79,7 @@ impl LinkStateTable {
             .binary_search_by(|probe| probe.cmp(&selected))
             .unwrap_or_else(|i| i);
         let selected_link = candidates[selected_index].clone();
-        let (addr_local, addr_remote) = selected_link.addr();
+        let (addr_local, addr_remote) = selected_link.local_remote_addr();
         // 以分配时间为准
         selected_link.update_usage();
         let solve = {
@@ -86,7 +92,7 @@ impl LinkStateTable {
             Box::new(move || {
                 let selected_link = selected_link
                     .upgrade()
-                    .ok_or(ResumeTaskError::LinkRefInvalid)?;
+                    .ok_or(LinkResumeTaskError::LinkRefInvalid)?;
                 if let Some(task) = selected_link.clone().deacitve() {
                     delay_task_sender.try_send(task)?;
                     Ok(())
@@ -110,21 +116,14 @@ impl LinkStateTable {
             })
         };
 
-        Ok(AssignedLink {
-            local: addr_local,
-            remote: addr_remote,
-            solve,
-        })
+        Ok(AssignedLink::new(addr_local, addr_remote, solve))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::{
-        HostId,
-        endpoint_tests::{mock_endpoint_lan, mock_endpoint_wan},
-    };
+    use crate::addr::endpoint_tests::{mock_endpoint_lan, mock_endpoint_wan};
     use anyhow::Result;
     use tokio::{task::yield_now, time::Duration};
 
@@ -142,7 +141,11 @@ mod tests {
         assert!(table.links.contains_key(&host));
         let bond = table.links.get(&host).unwrap();
         assert_eq!(bond.links.len(), 1);
-        assert!(bond.links.iter().any(|l| l.addr() == (ep1, ep2)));
+        assert!(
+            bond.links
+                .iter()
+                .any(|l| l.local_remote_addr() == (ep1, ep2))
+        );
         drop(bond);
         // 测试添加不同链路
         let ep3 = mock_endpoint_lan();
@@ -176,15 +179,15 @@ mod tests {
 
         // 测试正常分配
         let assigned = table.assign(&host)?;
-        assert_eq!(assigned.local, ep_local1);
-        assert!([ep_remote1, ep_remote2].contains(&assigned.remote));
+        assert_eq!(*assigned.local(), ep_local1);
+        assert!([ep_remote1, ep_remote2].contains(assigned.remote()));
 
         // 验证最后使用时间更新
         let bond = table.links.get(&host).unwrap();
         let link = bond
             .links
             .iter()
-            .find(|l| l.addr_remote == assigned.remote)
+            .find(|l| l.addr_remote == *assigned.remote())
             .unwrap();
         let last_used = link.last_used.load(Ordering::Relaxed);
         assert!(last_used > 0);
@@ -229,7 +232,7 @@ mod tests {
 
         // 获取并标记链路失败
         let assigned = table.assign(&host)?;
-        (assigned.solve)()?;
+        assigned.solve()?;
 
         // 快进时间触发恢复
         tokio::task::yield_now().await; // 确保任务执行
@@ -255,7 +258,7 @@ mod tests {
         // 分配三次
         for _ in 0..3 {
             let assigned = table.assign(&host)?;
-            (assigned.solve)()?; // 此操作会让链路失败状态+1
+            assigned.solve()?; // 此操作会让链路失败状态+1
             yield_now().await;
             tokio::time::advance(Duration::from_mins(2)).await; // 快进1分钟
             yield_now().await;
@@ -263,7 +266,7 @@ mod tests {
         // 三次之后就应该触发链路失效流程
         let a = table.assign(&host);
         assert!(a.is_ok());
-        (a.unwrap().solve)()?;
+        a.unwrap().solve()?;
         assert_eq!(table.links.get(&host).is_none(), true);
         let l = table.assign(&host);
         assert!(matches!(l, Err(LinkError::BondNotFound)));

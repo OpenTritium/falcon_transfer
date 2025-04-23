@@ -1,30 +1,54 @@
-use super::MsgSinkMap;
-use crate::{
-    link::LinkStateTable,
-    utils::{HostId, Msg},
-};
-use anyhow::Result;
-use anyhow::anyhow;
+use super::HostId;
+use super::NetworkMsg;
+use super::NetworkMsgSinkMap;
+use crate::link::LinkStateTable;
+use crate::link::NetworkEvent;
 use futures::SinkExt;
 use std::sync::Arc;
+use tokio::{sync::mpsc, task::AbortHandle};
+use tracing::info;
+use tracing::warn;
 
-struct Outbound {
-    links: Arc<LinkStateTable>,
-    inner: MsgSinkMap, // Fields and methods for the Outbound struct
+pub struct Outbound {
+    abort: AbortHandle,
 }
 
 impl Outbound {
-    pub fn new(links: Arc<LinkStateTable>, inner: MsgSinkMap) -> Self {
-        Self { links, inner }
+    pub fn run(
+        links: Arc<LinkStateTable>,
+        mut sinks: NetworkMsgSinkMap,
+    ) -> (Self, mpsc::Sender<(HostId, NetworkEvent)>) {
+        let (tx, mut rx) = mpsc::channel(10240);
+        let abort = tokio::spawn(async move {
+            while let Some((host, event)) = rx.recv().await {
+                let Ok(link) = links.assign(&host) else {
+                    warn!("No reachable link found in the link state table for hostId: {}, network event: {:#?} will be drop",host,event);
+                    continue;
+                };
+                let msg = match event {
+                    NetworkEvent::Auth(state) => NetworkMsg::Auth { host, state },
+                    NetworkEvent::Task(cipher) => NetworkMsg::Task { host, cipher: cipher.to_vec() },
+                };
+                let local = link.local();
+                let remote = *link.remote();
+                let Some(sink) = sinks.get_mut(local) else {
+                    warn!("No sink for {local}");
+                    continue;
+                };
+                // Use .send().await and handle errors gracefully
+                if let Err(e) = sink.send((msg, remote.into())).await {
+                    warn!("Failed to send message to sink for {local} -> {remote} : {:?}", e);
+                }
+            }
+        })
+        .abort_handle();
+        (Self { abort }, tx)
     }
+}
 
-    pub async fn send(&mut self, target: &HostId, msg: Msg) -> Result<()> {
-        let link = self.links.assign(target).unwrap();
-        let remote = link.remote;
-        let Some(sink) = self.inner.get_mut(&remote) else {
-            return Err(anyhow!("No sink found for address: {}", remote));
-        };
-        sink.send((msg, remote.into())).await?; //todo feed and flush
-        Ok(())
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        self.abort.abort();
+        info!("Outbound has been aborted");
     }
 }

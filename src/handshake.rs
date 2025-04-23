@@ -48,9 +48,8 @@ fn ActiveAuth() -> Result<StatelessTransportState> {
     const PATTERN: &str = "Noise_XX_25519_AESGCM_BLAKE2b";
     let builder = Builder::new(PATTERN.parse()?);
     let local_key = builder.generate_keypair()?;
-    let handshake = builder.local_private_key(&local_key.private).build_initiator()?;
+    let handshake = builder
+        .local_private_key(&local_key.private)
+        .build_initiator()?;
     handshake.into_stateless_transport_mode().context("")
 }
-
-
-

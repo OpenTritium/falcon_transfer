@@ -50,7 +50,7 @@ fn bench_write(c: &mut Criterion) {
                 || prepare_file_sync(size, false),
                 |(file, data)| async move {
                     let hot_file = HotFile::open_existed(&file).await.unwrap();
-                    hot_file.write(data.clone(), 0).await.unwrap();
+                    hot_file.write(&data, 0).await.unwrap();
                     hot_file.sync().await.unwrap();
                 },
                 BatchSize::SmallInput,
@@ -144,7 +144,7 @@ fn bench_concurrent(c: &mut Criterion) {
                             let hf = hot_file.clone();
                             let data = random_data(chunk_size);
                             handles.push(tokio::spawn(async move {
-                                hf.write(data, i * chunk_size).await.unwrap();
+                                hf.write(&data, i * chunk_size).await.unwrap();
                             }));
                         }
 

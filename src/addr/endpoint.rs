@@ -120,7 +120,7 @@ impl TryFrom<SocketAddrV6> for EndPoint {
 #[cfg(test)]
 pub mod tests {
 
-    use crate::utils::addr::scoped_addr::tests::{mock_scoped_lan, mock_scoped_wan};
+    use crate::addr::scoped_addr::tests::{mock_scoped_lan, mock_scoped_wan};
 
     use super::EndPoint;
 

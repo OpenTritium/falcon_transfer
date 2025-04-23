@@ -37,38 +37,20 @@ mod benchmarks {
     // FileRange基本操作
     fn filerange_ops(c: &mut Criterion) {
         c.bench_function("FileRange::intersect", |b| {
-            let r1 = FileRange {
-                start: 100,
-                end: 200,
-            };
-            let r2 = FileRange {
-                start: 150,
-                end: 250,
-            };
+            let r1 = FileRange::new(100, 200);
+            let r2 = FileRange::new(150, 250);
             b.iter(|| r1.intersect(black_box(&r2)))
         });
 
         c.bench_function("FileRange::union", |b| {
-            let r1 = FileRange {
-                start: 100,
-                end: 200,
-            };
-            let r2 = FileRange {
-                start: 150,
-                end: 250,
-            };
+            let r1 = FileRange::new(100, 200);
+            let r2 = FileRange::new(150, 250);
             b.iter(|| r1.union(black_box(&r2)))
         });
 
         c.bench_function("FileRange::subtract", |b| {
-            let r1 = FileRange {
-                start: 100,
-                end: 200,
-            };
-            let r2 = FileRange {
-                start: 150,
-                end: 250,
-            };
+            let r1 = FileRange::new(100, 200);
+            let r2 = FileRange::new(150, 250);
             b.iter(|| r1.subtract(black_box(&r2)))
         });
     }

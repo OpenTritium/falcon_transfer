@@ -12,7 +12,7 @@ pub enum UidError {
     Invalid(String),
 }
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Encode,Decode)]
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Encode, Decode)]
 pub struct Uid(String);
 
 impl Uid {
