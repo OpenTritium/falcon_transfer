@@ -8,17 +8,17 @@ use tracing::warn;
 pub struct MsgCodec;
 
 impl MsgCodec {
-    const HEADER_LEN: usize = size_of::<u16>() + size_of::<u8>();
-    const MSG_MAX_LEN: usize = 9999; // todo
+    const HDR_LEN: usize = size_of::<u16>() + size_of::<u8>();
+    const MSG_MAX_LEN: usize = u16::MAX as usize;
 }
 
 impl Encoder<NetworkMsg> for MsgCodec {
     type Error = anyhow::Error;
     fn encode(&mut self, item: NetworkMsg, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let mut msg_buf = vec![]; // todo 内存分配优化
-        let msg_len = bincode::encode_into_slice(item, &mut msg_buf, bincode::config::standard())?;
+        let msg_buf = bincode::encode_to_vec(item, bincode::config::standard())?;
+        let msg_len = msg_buf.len();
         dst.extend(
-            ((msg_len + Self::HEADER_LEN) as u16)
+            ((msg_len + Self::HDR_LEN) as u16) // udp 包长
                 .to_be_bytes()
                 .iter()
                 .copied()
@@ -34,7 +34,7 @@ impl Decoder for MsgCodec {
     type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < MsgCodec::HEADER_LEN {
+        if src.len() < MsgCodec::HDR_LEN {
             // 消息头未接收完
             return Ok(None);
         }
@@ -57,7 +57,7 @@ impl Decoder for MsgCodec {
             return Ok(None);
         }
         let (msg, _) = bincode::decode_from_slice::<NetworkMsg, _>(
-            &src.split_to(msg_len)[Self::HEADER_LEN..],
+            &src.split_to(msg_len)[Self::HDR_LEN..], // 截断消息长度前的部分并去除消息头
             bincode::config::standard(),
         )?;
         Ok(Some(msg))

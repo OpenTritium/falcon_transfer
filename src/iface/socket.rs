@@ -3,7 +3,6 @@ use crate::{
     addr::{EndPoint, RawIpv6Addr},
     config::global_config,
 };
-
 use anyhow::Result;
 use futures::{
     StreamExt,
@@ -21,7 +20,7 @@ async fn create_socket(addr: &EndPoint) -> Result<UdpSocket> {
     let multi_addr = RawIpv6Addr::from_segments([0xFF12, 0, 0, 0, 0, 0, 0, 1]);
     let sock = UdpSocket::bind(SocketAddr::from(*addr)).await?;
     if let Some(scope_id) = addr.get_scope_id() {
-        sock.join_multicast_v6(&multi_addr, scope_id)?;
+        sock.join_multicast_v6(&multi_addr, *scope_id)?;
         sock.set_multicast_loop_v6(false)?;
     }
     Ok(sock)

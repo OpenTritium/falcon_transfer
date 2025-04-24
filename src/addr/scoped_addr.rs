@@ -49,9 +49,9 @@ impl ScopedAddr {
         true
     }
 
-    pub fn get_raw(&self) -> RawIpv6Addr {
+    pub fn get_raw(&self) -> &RawIpv6Addr {
         match self {
-            Lan { addr, .. } | Wan(addr) => *addr,
+            Lan { addr, .. } | Wan(addr) => addr,
         }
     }
 }

@@ -1,8 +1,10 @@
-use super::scoped_addr::{
-    RawIpv6Addr, ScopeId,
-    ScopedAddr::{self, *},
+use super::{
+    DomainError, ParseError,
+    scoped_addr::{
+        RawIpv6Addr, ScopeId,
+        ScopedAddr::{self, *},
+    },
 };
-use super::{ParseError, error::DomainError};
 use bincode::{Decode, Encode};
 use regex::Regex;
 use std::{
@@ -25,8 +27,8 @@ impl Display for EndPoint {
     }
 }
 
-// flow_info deafult to 0
 impl From<EndPoint> for SocketAddrV6 {
+    /// flow_info deafult to 0
     fn from(ep: EndPoint) -> Self {
         match ep {
             EndPoint {
@@ -45,9 +47,9 @@ impl FromStr for EndPoint {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let re = Regex::new(r"\[([0-9a-fA-F:]+(?:%\d+)?)\]:(\d+)").unwrap();
+        let regex = Regex::new(r"\[([0-9a-fA-F:]+(?:%\d+)?)\]:(\d+)").unwrap();
         let failed_match_error = || ParseError::FaildToMatchEndpoint(s.to_string());
-        let caps = re.captures(s).ok_or_else(failed_match_error)?;
+        let caps = regex.captures(s).ok_or_else(failed_match_error)?;
         let addr = caps
             .get(1)
             .ok_or_else(failed_match_error)?
@@ -73,19 +75,20 @@ impl EndPoint {
         Self { addr, port }
     }
 
-    pub fn get_addr(&self) -> RawIpv6Addr {
+    pub fn get_addr(&self) -> &RawIpv6Addr {
         self.addr.get_raw()
     }
 
-    pub fn get_scoped_addr(&self) -> ScopedAddr {
-        self.addr
+    pub fn get_scoped_addr(&self) -> &ScopedAddr {
+        &self.addr
     }
 
-    pub fn get_scope_id(&self) -> Option<ScopeId> {
-        let Lan { scope, .. } = self.get_scoped_addr() else {
-            return None;
-        };
-        Some(scope)
+    pub fn get_scope_id(&self) -> Option<&ScopeId> {
+        if let Lan { scope, .. } = self.get_scoped_addr() {
+            Some(scope)
+        } else {
+            None
+        }
     }
 
     pub fn is_lan(&self) -> bool {
