@@ -7,7 +7,7 @@ mod benchmarks {
     use falcon_transfer::hot_file::{FileMultiRange, FileRange};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-
+    
     // 生成有序不重叠区间
     fn generate_sorted_ranges(count: usize, size: usize) -> Vec<(usize, usize)> {
         (0..count)

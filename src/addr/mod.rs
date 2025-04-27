@@ -3,9 +3,13 @@ mod error;
 mod scoped_addr;
 
 #[cfg(test)]
-pub use endpoint::tests as endpoint_tests;
-pub use endpoint::*;
-pub use error::*;
+pub use endpoint::tests::{mock_endpoint_lan,mock_endpoint_wan};
 #[cfg(test)]
-pub use scoped_addr::tests as scoped_addr_tests;
+pub use scoped_addr::tests::{mock_scoped_lan,mock_scoped_wan};
+
+
+pub use endpoint::{
+    Port,EndPoint
+};
+pub use error::*;
 pub use scoped_addr::*;

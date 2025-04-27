@@ -1,8 +1,12 @@
-use super::NetworkMsg;
-use crate::config::global_config;
+
+
+
+use super::Msg;
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::warn;
+
+const PROTOCOL_VERSION:u8 = 0;
 
 #[derive(Default)]
 pub struct MsgCodec;
@@ -12,9 +16,9 @@ impl MsgCodec {
     const MSG_MAX_LEN: usize = u16::MAX as usize;
 }
 
-impl Encoder<NetworkMsg> for MsgCodec {
+impl Encoder<Msg> for MsgCodec {
     type Error = anyhow::Error;
-    fn encode(&mut self, item: NetworkMsg, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: Msg, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let msg_buf = bincode::encode_to_vec(item, bincode::config::standard())?;
         let msg_len = msg_buf.len();
         dst.extend(
@@ -22,7 +26,7 @@ impl Encoder<NetworkMsg> for MsgCodec {
                 .to_be_bytes()
                 .iter()
                 .copied()
-                .chain([global_config().protocol_version].iter().copied())
+                .chain([PROTOCOL_VERSION].iter().copied())
                 .chain(msg_buf),
         );
         Ok(())
@@ -30,7 +34,7 @@ impl Encoder<NetworkMsg> for MsgCodec {
 }
 
 impl Decoder for MsgCodec {
-    type Item = NetworkMsg;
+    type Item = Msg;
     type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -51,12 +55,12 @@ impl Decoder for MsgCodec {
             src.reserve(msg_len - src.len());
             return Ok(None);
         }
-        if protocol_version != global_config().protocol_version {
+        if protocol_version != PROTOCOL_VERSION {
             // 协议版本不对，忽略此条消息
             src.advance(msg_len);
             return Ok(None);
         }
-        let (msg, _) = bincode::decode_from_slice::<NetworkMsg, _>(
+        let (msg, _) = bincode::decode_from_slice::<Msg, _>(
             &src.split_to(msg_len)[Self::HDR_LEN..], // 截断消息长度前的部分并去除消息头
             bincode::config::standard(),
         )?;

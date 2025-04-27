@@ -1,9 +1,9 @@
 use super::{
-    DomainError, ParseError,
     scoped_addr::{
-        RawIpv6Addr, ScopeId,
+        StdIpv6Addr, ScopeId,
         ScopedAddr::{self, *},
     },
+    DomainError, ParseError,
 };
 use bincode::{Decode, Encode};
 use regex::Regex;
@@ -29,17 +29,8 @@ impl Display for EndPoint {
 
 impl From<EndPoint> for SocketAddrV6 {
     /// flow_info deafult to 0
-    fn from(ep: EndPoint) -> Self {
-        match ep {
-            EndPoint {
-                addr: Lan { addr, scope },
-                port,
-            } => SocketAddrV6::new(addr, port, 0, scope),
-            EndPoint {
-                addr: Wan(addr),
-                port,
-            } => SocketAddrV6::new(addr, port, 0, 0),
-        }
+    fn from(EndPoint { addr, port }: EndPoint) -> Self {
+        SocketAddrV6::new(*addr.get_std(), port, 0, addr.scope_id().unwrap_or_default())
     }
 }
 
@@ -75,16 +66,16 @@ impl EndPoint {
         Self { addr, port }
     }
 
-    pub fn get_addr(&self) -> &RawIpv6Addr {
-        self.addr.get_raw()
+    pub fn std_addr(&self) -> &StdIpv6Addr {
+        self.addr.get_std()
     }
 
-    pub fn get_scoped_addr(&self) -> &ScopedAddr {
+    pub fn scoped_addr(&self) -> &ScopedAddr {
         &self.addr
     }
 
     pub fn get_scope_id(&self) -> Option<&ScopeId> {
-        if let Lan { scope, .. } = self.get_scoped_addr() {
+        if let Lan { scope, .. } = self.scoped_addr() {
             Some(scope)
         } else {
             None
@@ -122,9 +113,7 @@ impl TryFrom<SocketAddrV6> for EndPoint {
 
 #[cfg(test)]
 pub mod tests {
-
-    use crate::addr::scoped_addr::tests::{mock_scoped_lan, mock_scoped_wan};
-
+    use super::super::{mock_scoped_lan, mock_scoped_wan};
     use super::EndPoint;
 
     pub fn mock_endpoint_lan() -> EndPoint {

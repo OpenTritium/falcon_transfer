@@ -1,12 +1,14 @@
-use crate::{addr::EndPoint, utils::Uid};
+use crate::addr::EndPoint;
+use crate::link::Uid;
 use bincode::{Decode, Encode};
 
 pub type HostId = Uid;
 
 #[derive(Debug, Clone, Encode, Decode)]
-pub enum NetworkMsg {
+pub enum Msg {
     /// 发现报文用于构建链路状态表，这里包含的是对方的HostId和地址
     /// 在链路层处理
+    /// 其他发现方式直接通过事件接入
     Discovery {
         host: HostId,
         remote: EndPoint,
@@ -22,9 +24,9 @@ pub enum NetworkMsg {
     },
 }
 
-impl NetworkMsg {
+impl Msg {
     pub fn host(&self) -> &HostId {
-        use NetworkMsg::*;
+        use Msg::*;
         match self {
             Discovery { host, .. } | Auth { host, .. } | Task { host, .. } => host,
         }

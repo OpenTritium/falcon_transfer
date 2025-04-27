@@ -10,6 +10,7 @@ pub struct Bond {
 }
 
 impl Bond {
+    /// 此时bond状态必为发现
     pub fn new(local: &EndPoint, remote: &EndPoint) -> Self {
         Self {
             links: indexset! {Arc::new(LinkState::new(*local, *remote, 0))},
@@ -18,6 +19,7 @@ impl Bond {
     }
 
     /// 仅当不存在时才构造link_state
+    /// 如果 bond 中已经存在此链路则返回 false
     pub fn update(&mut self, local: EndPoint, remote: EndPoint) -> bool {
         if self
             .links
@@ -30,6 +32,9 @@ impl Bond {
         self.links
             .insert(Arc::new(LinkState::new(local, remote, 0)))
     }
+
+    // 没有remove 方法是因为bond 空了整个容器都会被移除
+    // todo 实现迁移状态
 }
 
 #[cfg(test)]

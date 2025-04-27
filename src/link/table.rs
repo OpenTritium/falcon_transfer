@@ -1,6 +1,6 @@
 use super::LinkResumeTaskError;
 use crate::addr::EndPoint;
-use crate::iface::HostId;
+use crate::inbound::HostId;
 use crate::link::assigned::AssignedLink;
 use crate::link::bond::Bond;
 use crate::link::link_state::LinkError;
@@ -123,7 +123,7 @@ impl LinkStateTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addr::endpoint_tests::{mock_endpoint_lan, mock_endpoint_wan};
+    use crate::addr::{mock_endpoint_lan, mock_endpoint_wan};
     use anyhow::Result;
     use tokio::{task::yield_now, time::Duration};
 

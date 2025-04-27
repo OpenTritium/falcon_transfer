@@ -36,7 +36,7 @@ pub type TaggedTaskEvent = (TaskTag, TaskEvent);
 
 pub struct FileInfo {
     file_hash: FileHash,
-    file_name: Box<Path>, //绝对路径
+    file_name: PathBuf, //文件名
     size: usize,
 }
 

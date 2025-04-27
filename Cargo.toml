@@ -28,13 +28,16 @@ regex = "1.6.0"
 socket2 = "0.5.8"
 console-subscriber = "0.4.1"
 rayon = "1.10.0"
-rand = "0.9.0"
-indexmap = "2.7.1"
+rand = "0.9.1"
+indexmap = "2.9.0"
 xxhash-rust = {version= "0.8.15",features=["xxh3"]}
 smallvec = "1.14.0"
 object-pool = "0.6.0"
 tokio-stream = "0.1.17"
-teloc = "0.2.0"
+notify-debouncer-mini = "0.6.0"
+config = "0.15.11"
+cached = "0.55.1"
+indoc = "2.0.6"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }

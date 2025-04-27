@@ -1,3 +1,8 @@
-mod cfg;
+mod config;
+mod instance;
 
-pub use cfg::*;
+#[cfg(test)]
+pub use config::tests::mock;
+
+pub use config::*;
+pub use instance::*; 

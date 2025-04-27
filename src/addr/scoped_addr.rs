@@ -3,15 +3,14 @@ use ScopedAddr::*;
 use bincode::{Decode, Encode};
 use std::{fmt::Display, net::Ipv6Addr, str::FromStr};
 
-pub type RawIpv6Addr = std::net::Ipv6Addr;
+pub type StdIpv6Addr = std::net::Ipv6Addr;
 pub type ScopeId = u32;
-pub type AddrWithScope = (RawIpv6Addr, ScopeId);
 
-// only for unicast address
 #[derive(Debug, Copy, Clone, Encode, Decode, PartialEq, Hash, Eq)]
+/// only for unicast address
 pub enum ScopedAddr {
-    Lan { addr: RawIpv6Addr, scope: ScopeId },
-    Wan(RawIpv6Addr),
+    Lan { addr: StdIpv6Addr, scope: ScopeId },
+    Wan(StdIpv6Addr),
 }
 
 impl Display for ScopedAddr {
@@ -45,21 +44,31 @@ impl ScopedAddr {
     }
 
     pub fn is_wan(&self) -> bool {
-        let Wan(_) = self else { return false };
-        true
+        if let Wan(_) = self {
+            true
+        } else {
+            false
+        }
     }
 
-    pub fn get_raw(&self) -> &RawIpv6Addr {
+    pub fn get_std(&self) -> &StdIpv6Addr {
         match self {
             Lan { addr, .. } | Wan(addr) => addr,
         }
     }
+    
+    pub fn scope_id(&self) -> Option<ScopeId> {
+        match self {
+            Lan { scope, .. } => Some(*scope),
+            Wan(_) => None,
+        }
+    }
 }
 
-impl TryFrom<(RawIpv6Addr, ScopeId)> for ScopedAddr {
+impl TryFrom<(StdIpv6Addr, ScopeId)> for ScopedAddr {
     type Error = DomainError;
 
-    fn try_from((addr, scope): AddrWithScope) -> Result<Self, Self::Error> {
+    fn try_from((addr, scope): (StdIpv6Addr, ScopeId)) -> Result<Self, Self::Error> {
         if addr.is_unicast_link_local() {
             return Ok(Lan { addr, scope });
         }
@@ -67,10 +76,10 @@ impl TryFrom<(RawIpv6Addr, ScopeId)> for ScopedAddr {
     }
 }
 
-impl TryFrom<RawIpv6Addr> for ScopedAddr {
+impl TryFrom<StdIpv6Addr> for ScopedAddr {
     type Error = DomainError;
 
-    fn try_from(addr: RawIpv6Addr) -> Result<Self, Self::Error> {
+    fn try_from(addr: StdIpv6Addr) -> Result<Self, Self::Error> {
         if addr.is_unicast_global() {
             return Ok(Wan(addr));
         }
@@ -78,7 +87,7 @@ impl TryFrom<RawIpv6Addr> for ScopedAddr {
     }
 }
 
-impl From<ScopedAddr> for RawIpv6Addr {
+impl From<ScopedAddr> for StdIpv6Addr {
     fn from(scoped_addr: ScopedAddr) -> Self {
         match scoped_addr {
             Lan { addr, .. } | Wan(addr) => addr,
@@ -88,7 +97,7 @@ impl From<ScopedAddr> for RawIpv6Addr {
 
 impl From<ScopedAddr> for std::net::IpAddr {
     fn from(scoped_addr: ScopedAddr) -> Self {
-        RawIpv6Addr::from(scoped_addr).into()
+        StdIpv6Addr::from(scoped_addr).into()
     }
 }
 
@@ -104,8 +113,9 @@ pub mod tests {
         let p1: u16 = rng.random_range(0..=0xFFFF);
         let p2: u16 = rng.random_range(0..=0xFFFF);
         let p3: u16 = rng.random_range(0..=0xFFFF);
-        let addr = RawIpv6Addr::new(0xFE80, 0, 0, 0, p0, p1, p2, p3);
-        (addr, 17).try_into().unwrap()
+        let scope: ScopeId = rng.random_range(0..=0xFFFFFFFF);
+        let addr = StdIpv6Addr::new(0xFE80, 0, 0, 0, p0, p1, p2, p3);
+        (addr, scope).try_into().unwrap()
     }
 
     pub fn mock_scoped_wan() -> ScopedAddr {
@@ -117,7 +127,7 @@ pub mod tests {
         let p4: u16 = rng.random_range(0..=0xFFFF);
         let p5: u16 = rng.random_range(0..=0xFFFF);
         let p6: u16 = rng.random_range(0..=0xFFFF);
-        let addr = RawIpv6Addr::new(0x240e, p0, p1, p2, p3, p4, p5, p6);
+        let addr = StdIpv6Addr::new(0x240e, p0, p1, p2, p3, p4, p5, p6);
         addr.try_into().unwrap()
     }
 
@@ -125,7 +135,7 @@ pub mod tests {
     const WAN_IP: &str = "240e:430:123b:79d8:cf61:9682:3589:64e6";
     #[test]
     fn valid_unicast_link_local() -> Result<(), DomainError> {
-        let addr = LAN_IP.parse::<RawIpv6Addr>().unwrap();
+        let addr = LAN_IP.parse::<StdIpv6Addr>().unwrap();
         let scope = 0;
         let lan = ScopedAddr::try_from((addr, scope))?;
         assert_eq!(lan, ScopedAddr::Lan { addr, scope });
@@ -135,7 +145,7 @@ pub mod tests {
 
     #[test]
     fn valid_unicast_global() -> Result<(), DomainError> {
-        let addr = WAN_IP.parse::<RawIpv6Addr>().unwrap();
+        let addr = WAN_IP.parse::<StdIpv6Addr>().unwrap();
         let wan = ScopedAddr::try_from(addr)?;
         assert_eq!(wan, ScopedAddr::Wan(addr));
         assert_eq!(wan.is_wan(), true);
@@ -145,14 +155,14 @@ pub mod tests {
     #[test]
     #[should_panic]
     fn ula_into_global() {
-        let addr = "FC00:0:0:0:1:2:3:4".parse::<RawIpv6Addr>().unwrap();
+        let addr = "FC00:0:0:0:1:2:3:4".parse::<StdIpv6Addr>().unwrap();
         ScopedAddr::try_from(addr).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn ula_into_link_local() {
-        let addr = "FC00:0:0:0:1:2:3:4".parse::<RawIpv6Addr>().unwrap();
+        let addr = "FC00:0:0:0:1:2:3:4".parse::<StdIpv6Addr>().unwrap();
         let scope = 1;
         ScopedAddr::try_from((addr, scope)).unwrap();
     }
@@ -160,7 +170,7 @@ pub mod tests {
     #[test]
     #[should_panic]
     fn global_multicast_into_unicast() {
-        let addr = "FF0E::1".parse::<RawIpv6Addr>().unwrap();
+        let addr = "FF0E::1".parse::<StdIpv6Addr>().unwrap();
         ScopedAddr::try_from(addr).unwrap();
     }
 
@@ -168,7 +178,7 @@ pub mod tests {
     #[should_panic]
     fn link_local_multicast_into_unicast() {
         let scope = 1;
-        let addr = "FF02::1".parse::<RawIpv6Addr>().unwrap();
+        let addr = "FF02::1".parse::<StdIpv6Addr>().unwrap();
         ScopedAddr::try_from((addr, scope)).unwrap();
     }
 
@@ -176,14 +186,14 @@ pub mod tests {
     #[should_panic]
     fn global_into_link_local() {
         let scope = 3;
-        let addr = WAN_IP.parse::<RawIpv6Addr>().unwrap();
+        let addr = WAN_IP.parse::<StdIpv6Addr>().unwrap();
         ScopedAddr::try_from((addr, scope)).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn link_local_into_global() {
-        let addr = LAN_IP.parse::<RawIpv6Addr>().unwrap();
+        let addr = LAN_IP.parse::<StdIpv6Addr>().unwrap();
         ScopedAddr::try_from(addr).unwrap();
     }
 
@@ -198,7 +208,7 @@ pub mod tests {
     #[test]
     fn parse_wan_addr() -> Result<()> {
         let addr = str::parse::<ScopedAddr>(WAN_IP)?;
-        let expected: ScopedAddr = WAN_IP.parse::<RawIpv6Addr>()?.try_into()?;
+        let expected: ScopedAddr = WAN_IP.parse::<StdIpv6Addr>()?.try_into()?;
         assert_eq!(addr, expected);
         Ok(())
     }
