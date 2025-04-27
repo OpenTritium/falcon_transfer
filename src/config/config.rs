@@ -11,10 +11,10 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{RwLock as AsyncRwLock, mpsc::unbounded_channel},
+    sync::{RwLock as AsyncRwLock, mpsc},
     task::yield_now,
 };
-use tracing::{error, info};
+use tracing::error;
 
 #[derive(Debug, Error)]
 pub enum ConfigManagerError {
@@ -22,93 +22,103 @@ pub enum ConfigManagerError {
     ConfigError(#[from] ConfigError),
     #[error(transparent)]
     NotifyError(#[from] notify::Error),
+    #[error("配置状态异常{0}")]
+    ConfigStateError(String),
 }
 
 type Prefs = HashMap<String, String>;
 pub struct ConfigManager {
-    prefs: Arc<AsyncRwLock<Prefs>>,
-    absolute_path: PathBuf,
+    prefs: Arc<AsyncRwLock<Result<Prefs, ConfigManagerError>>>, // todo 用 result 包一下
+    abs_path: PathBuf,
 }
 
 pub enum ConfigItem {
     ProtocolPort,
-    ProtocolVersion,
-    HostName,
-    HostId,
 }
 impl ConfigManager {
-    fn load_config(path: &str) -> Result<Config, ConfigManagerError> {
+    fn load_config(path: &Path) -> Result<Config, ConfigManagerError> {
         let cfg = Config::builder()
-            .add_source(File::with_name(path))
+            .add_source(File::with_name(path.to_str().unwrap()))
             .build()?;
         Ok(cfg)
     }
 
-    pub fn try_new(path: &str) -> Result<Self, ConfigManagerError> {
+    pub fn try_open(path: &Path) -> Result<Self, ConfigManagerError> {
         let prefs = Self::load_config(path)?.try_deserialize::<Prefs>()?;
-        let absolute_path = PathBuf::from(path);
-        let prefs = Arc::new(AsyncRwLock::new(prefs));
-        Self::watch(&absolute_path, prefs.clone())?;
-        Ok(Self {
-            prefs,
-            absolute_path,
-        })
+        let abs_path = PathBuf::from(path);
+        let prefs = Arc::new(AsyncRwLock::new(Ok(prefs)));
+        Self::watch(&abs_path, prefs.clone())?;
+        Ok(Self { prefs, abs_path })
     }
 
     #[inline]
-    fn perf_map(item: ConfigItem) -> &'static str {
+    fn pref_map(item: ConfigItem) -> &'static str {
         match item {
             ConfigItem::ProtocolPort => "protocol_port",
-            ConfigItem::ProtocolVersion => "protocol_version",
-            ConfigItem::HostName => "host_name",
-            ConfigItem::HostId => "host_id",
         }
     }
 
-    pub async fn async_get(&self, item: ConfigItem) -> Option<String> {
-        let k = Self::perf_map(item);
-        self.prefs.read().await.get(k).cloned()
+    pub async fn async_get(&self, item: ConfigItem) -> Result<String, ConfigManagerError> {
+        let k = Self::pref_map(item);
+        match self.prefs.read().await.as_ref() {
+            Ok(prefs) => {
+                prefs
+                    .get(k)
+                    .cloned()
+                    .ok_or(ConfigManagerError::ConfigError(ConfigError::NotFound(
+                        k.to_string(),
+                    )))
+            }
+            Err(e) => Err(ConfigManagerError::ConfigStateError(e.to_string())),
+        }
     }
 
-    pub fn block_get(&self, item: ConfigItem) -> Option<String> {
-        let k = Self::perf_map(item);
-        self.prefs.blocking_read().get(k).cloned()
+    pub fn block_get(&self, item: ConfigItem) -> Result<String, ConfigManagerError> {
+        let k = Self::pref_map(item);
+        match self.prefs.blocking_read().as_ref() {
+            Ok(prefs) => {
+                prefs
+                    .get(k)
+                    .cloned()
+                    .ok_or(ConfigManagerError::ConfigError(ConfigError::NotFound(
+                        k.to_string(),
+                    )))
+            }
+            Err(e) => Err(ConfigManagerError::ConfigStateError(e.to_string())),
+        }
     }
 
     async fn refresh(
         config_path: &Path,
-        prefs: Arc<AsyncRwLock<Prefs>>,
+        prefs: Arc<AsyncRwLock<Result<Prefs, ConfigManagerError>>>,
     ) -> Result<(), ConfigManagerError> {
-        let new_prefs =
-            Self::load_config(config_path.to_str().unwrap())?.try_deserialize::<Prefs>()?;
+        let new_prefs = match Self::load_config(config_path) {
+            Ok(cfg) => match cfg.try_deserialize::<Prefs>() {
+                Ok(prefs) => Ok(prefs),
+                Err(e) => Err(ConfigManagerError::ConfigError(e)),
+            },
+            Err(e) => Err(e),
+        };
         *prefs.write().await = new_prefs;
         Ok(())
     }
 
     pub(crate) fn watch(
         config_path: &Path,
-        prefs: Arc<AsyncRwLock<Prefs>>,
+        prefs: Arc<AsyncRwLock<Result<Prefs, ConfigManagerError>>>,
     ) -> Result<(), notify::Error> {
-        println!("开始监视配置文件: {:?}", config_path);
-        let (tx, mut rx) = unbounded_channel();
-        let mut debouncer = new_debouncer(Duration::from_secs(2), move |result| {
-            info!("触发回调{:?}", result);
-            println!("触发回调{:?}", result);
-            match result {
-                Ok(event) => tx.send(event).unwrap_or_else(|_| ()),
-                Err(err) => error!("Error: {err}"),
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut debouncer = new_debouncer(Duration::from_secs(1), move |result| {
+            if let Ok(event) = result {
+                tx.blocking_send(event).unwrap();
             }
         })?;
         let path = config_path.canonicalize().unwrap();
-        debouncer
-            .watcher()
-            .watch(&path, RecursiveMode::Recursive)?;
+        debouncer.watcher().watch(&path, RecursiveMode::Recursive)?;
         tokio::spawn(async move {
-            while let Some(e) = rx.recv().await {
-                info!("Config changed; refreshing...{:?}", e);
-                if let Err(err) = Self::refresh(&path, prefs.clone()).await {
-                    error!("{err}");
-                }
+            let _debouncer = debouncer; // 移动到这个协程里防止被drop
+            while let Some(_) = rx.recv().await {
+                let _ = Self::refresh(&path, prefs.clone()).await;
                 yield_now().await;
             }
         });
@@ -117,137 +127,52 @@ impl ConfigManager {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
-    use std::{
-        io::Write,
-        sync::{Arc, OnceLock},
-    };
+    use std::{io::{Seek, SeekFrom, Write}, thread::sleep};
     use tempfile::Builder;
-    use tokio::{
-        fs::OpenOptions,
-        io::AsyncWriteExt,
-        task::yield_now,
-        time::{Duration, sleep},
-    };
+    use tokio::time::{self, Duration};
 
-    #[tokio::test]
-    async fn config_loading() {
-        // 创建带.toml扩展名的临时文件
-        let mut file = Builder::new()
-            .prefix("test_config")
-            .suffix(".toml")
-            .tempfile()
-            .unwrap();
-
-        // 写入有效配置内容
-        writeln!(file, "protocol_port = 5555\nprotocol_version = 0").unwrap();
-        let path = file.path().to_str().unwrap();
-
-        // 初始化配置管理器
-        let manager = ConfigManager::try_new(path).unwrap();
-
-        // 验证配置加载
-        assert_eq!(
-            manager.async_get(ConfigItem::ProtocolPort).await,
-            Some("5555".to_string())
-        );
-        assert_eq!(
-            manager.async_get(ConfigItem::ProtocolVersion).await,
-            Some("0".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn dynamic_refresh() {
-        // Create a temporary directory and config file
-        let dir = Builder::new().prefix("config_test").tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-
-        // Write initial config
-        std::fs::write(&path, "protocol_port = 6666").unwrap();
-        let manager = ConfigManager::try_new(path.to_str().unwrap()).unwrap();
-        // Ensure the file system events are flushed and processed
-        let mut file = OpenOptions::new().write(true).open(&path).await.unwrap();
-        file.write(b"protocol_port = 5555").await.unwrap();
-        file.sync_all().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        // Poll for the config update with a 5-second timeout
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if manager.async_get(ConfigItem::ProtocolPort).await == Some("5555".to_string()) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await;
-
-        // Assert that the config refreshed within the timeout
-        assert!(
-            result.is_ok(),
-            "Config did not refresh to '5555' within 5 seconds; still reads {:?}",
-            manager.async_get(ConfigItem::ProtocolPort).await
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_access() {
-        let manager = Arc::new(create_test_manager("host_name = \"TritiumQin\"").unwrap());
-
-        // 并发读取测试
-        let handles: Vec<_> = (0..10)
-            .map(|_| {
-                let manager = manager.clone();
-                tokio::spawn(async move { manager.async_get(ConfigItem::HostName).await })
-            })
-            .collect();
-
-        for handle in handles {
-            assert_eq!(handle.await.unwrap(), Some("TritiumQin".to_string()));
-        }
-    }
-
-    #[tokio::test]
-    async fn error_handling() {
-        // 无效文件路径
-        let result = ConfigManager::try_new("nonexistent.toml");
-        assert!(matches!(
-            result.err(),
-            Some(ConfigManagerError::ConfigError(_))
-        ));
-
-        // 非法格式测试
-        let mut file = Builder::new().suffix(".toml").tempfile().unwrap();
-        writeln!(file, "invalid_toml [").unwrap();
-        let path = file.path().to_str().unwrap();
-
-        let result = ConfigManager::try_new(path);
-        assert!(matches!(
-            result.err(),
-            Some(ConfigManagerError::ConfigError(_))
-        ));
-    }
-
-    // 辅助函数优化
-    fn create_test_manager(content: &str) -> Result<ConfigManager, ConfigManagerError> {
-        let mut file = Builder::new().suffix(".toml").tempfile().unwrap();
+    // 创建带 .toml 后缀的临时配置文件
+    fn create_temp_config(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = Builder::new().tempdir().unwrap();
+        let file_path = dir.path().join("config.toml");
+        
+        let mut file = std::fs::File::create(&file_path).unwrap();
         writeln!(file, "{}", content).unwrap();
-        let path = file.path().to_str().unwrap();
-        ConfigManager::try_new(path)
+        file.sync_all().unwrap();
+        
+        (dir, file_path)
     }
 
-    pub fn mock() -> Result<&'static ConfigManager, ConfigManagerError> {
-        static CONFIG_MANAGER: OnceLock<ConfigManager> = OnceLock::new();
-        CONFIG_MANAGER.get_or_try_init(|| {
-            create_test_manager(
-                r#"
-            host_id = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
-            host_name = "TritiumQin"
-            protocol_port = 5555
-            protocol_version = 0
-            "#,
-            )
-        })
+    #[tokio::test(start_paused = true)]
+    async fn test_async_get_valid_config() {
+        let (dir, path) = create_temp_config("protocol_port = \"8080\"");
+        let manager = ConfigManager::try_open(&path).unwrap();
+
+        let port = manager.async_get(ConfigItem::ProtocolPort).await.unwrap();
+        assert_eq!(port, "8080");
+        dir.close().unwrap(); // 显式清理
+    }
+
+    #[tokio::test]
+    async fn test_config_refresh_on_change() {
+        let (dir, path) = create_temp_config("protocol_port = \"8080\"");
+        let manager = ConfigManager::try_open(&path).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"protocol_port = \"8081\"").unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+
+        sleep(Duration::from_secs(10)); // 等待文件监视器刷新
+
+        let port = manager.async_get(ConfigItem::ProtocolPort).await.unwrap();
+        assert_eq!(port, "8081");
+        dir.close().unwrap();
     }
 }

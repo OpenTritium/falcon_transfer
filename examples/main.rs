@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use falcon_transfer::config::{ConfigItem, ConfigManager};
 use indoc::indoc;
 use tokio::{io::AsyncWriteExt, time::sleep, time::Duration};
@@ -6,10 +8,11 @@ use tokio::{io::AsyncWriteExt, time::sleep, time::Duration};
 async fn main() {
     tracing_subscriber::fmt::init();  // 初始化日志记录器
     // 首次创建并写入配置文件
+    let path = PathBuf::from("config.toml");
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .open("config.toml")
+        .open(&path)
         .await
         .unwrap();
 
@@ -26,11 +29,11 @@ async fn main() {
     file.sync_all().await.unwrap();  // 确保写入磁盘
 
     // 初始化配置管理器
-    let manager = ConfigManager::try_new("config.toml").unwrap();
+    let manager = ConfigManager::try_open(&path).unwrap();
     
     // 第一次读取
-    let id = manager.async_get(ConfigItem::HostId).await;
-    println!("首次读取 Host ID: {:?}", id);
+    let id = manager.async_get(ConfigItem::ProtocolPort).await;
+    println!("首次读取 Port: {:?}", id);
 
     // 覆盖文件内容（关键修改点）
     let mut file = tokio::fs::OpenOptions::new()
@@ -53,9 +56,9 @@ async fn main() {
     file.sync_all().await.unwrap();  // 确保写入磁盘
 
     // 添加等待时间（关键修改点）
-    sleep(Duration::from_secs(6)).await;  // 等待文件监视器刷新
+    sleep(Duration::from_secs(13)).await;  // 等待文件监视器刷新
     
     // 第二次读取
-    let id = manager.async_get(ConfigItem::HostId).await;
-    println!("更新后 Host ID: {:?}", id);
+    let id = manager.async_get(ConfigItem::ProtocolPort).await;
+    println!("更新后 Port: {:?}", id);
 }
