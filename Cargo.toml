@@ -38,6 +38,8 @@ notify-debouncer-mini = "0.6.0"
 config = "0.15.11"
 cached = "0.55.1"
 indoc = "2.0.6"
+toml = "0.8.21"
+atomicwrites = "0.4.4"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }
