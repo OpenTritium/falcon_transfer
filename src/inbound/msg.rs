@@ -4,7 +4,7 @@ use bincode::{Decode, Encode};
 
 pub type HostId = Uid;
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, PartialEq)]
 pub enum Msg {
     /// 发现报文用于构建链路状态表，这里包含的是对方的HostId和地址
     /// 在链路层处理
@@ -33,7 +33,7 @@ impl Msg {
     }
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, PartialEq)]
 pub enum Handshake {
     // -> e
     Hello(Vec<u8>),

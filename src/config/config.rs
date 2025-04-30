@@ -6,6 +6,7 @@ use notify_debouncer_mini::{
 };
 use std::{
     collections::HashMap,
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -27,17 +28,15 @@ pub enum ConfigManagerError {
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]
-    SerializeError(#[from] toml::de::Error),
-    #[error(transparent)]
-    DeserializeError(#[from] toml::ser::Error),
-    #[error(transparent)]
     WriteError(#[from] atomicwrites::Error<std::io::Error>),
+    #[error("config dir was not found")]
+    ConfigDirNotFound,
 }
 
 type Prefs = HashMap<String, String>;
 pub struct ConfigManager {
     prefs: Arc<AsyncRwLock<Prefs>>,
-    abs_path: PathBuf,
+    abs_path: PathBuf, // suffix must be .toml
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,12 +80,15 @@ impl ConfigManager {
         HashMap::from_iter([(ProtocolPort.into(), ProtocolPort.default().to_string())])
     }
 
-    pub fn try_open(path: &Path) -> Result<Self, ConfigManagerError> {
+    pub fn create(path: &Path) -> Result<Self, ConfigManagerError> {
+        if !path.exists() {
+            std::fs::File::create(&path)?;
+        }
         let abs_path = PathBuf::from(path);
         let cfg = match Self::load_config(path) {
             Ok(cfg) => cfg,
             Err(err) => {
-                error!("{err}, construct in default values");
+                error!("{err}, construct config manager in default values");
                 let prefs = Arc::new(AsyncRwLock::new(Self::default_inner()));
                 Self::watch(&abs_path, prefs.clone())?;
                 return Ok(Self { prefs, abs_path });
@@ -111,25 +113,30 @@ impl ConfigManager {
             .unwrap_or_else(|| item.default().to_string())
     }
 
-    pub fn block_get(&self, item: ConfigItem) -> String {
-        self.prefs
-            .blocking_read()
-            .get(item.into())
-            .cloned()
-            .unwrap_or_else(|| item.default().to_string())
-    }
-
+    // 如果之前的配置文件解析失败，应当生成新的空白配置文件并set
     pub async fn async_set(
         &self,
         item: ConfigItem,
-        value: String,
+        value: toml::Value,
     ) -> Result<(), ConfigManagerError> {
-        let content = tokio::fs::read_to_string(&self.abs_path).await?;
-        let mut table: toml::value::Table = toml::from_str(&content)?;
-        table.insert(item.into(), toml::Value::String(value));
-        let new_content = toml::to_string_pretty(&table)?;
-        let af = AtomicFile::new(&self.abs_path, AllowOverwrite);
-        af.write(|f| f.write_all(new_content.as_bytes()))?;
+        AtomicFile::new(&self.abs_path, AllowOverwrite).write_with_options(
+            |f| {
+                let content = std::fs::read_to_string(&self.abs_path)?;
+                let mut table: toml::value::Table = toml::from_str(&content).unwrap_or_default();
+                table.insert(item.into(), value);
+                let new_content =
+                    toml::to_string_pretty(&table).expect("Failed to serialize table");
+                f.write_all(new_content.as_bytes())?;
+                f.flush()?;
+                f.sync_all()?;
+                Ok(())
+            },
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .to_owned(),
+        )?;
         Ok(())
     }
 
@@ -194,7 +201,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn async_get_valid_config() {
         let (dir, path) = create_temp_config("protocol_port = \"8080\"");
-        let manager = ConfigManager::try_open(&path).unwrap();
+        let manager = ConfigManager::create(&path).unwrap();
 
         let port = manager.async_get(ConfigItem::ProtocolPort).await;
         assert_eq!(port, "8080");
@@ -204,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn config_refresh_on_change() {
         let (dir, path) = create_temp_config("protocol_port = \"8080\"");
-        let manager = ConfigManager::try_open(&path).unwrap();
+        let manager = ConfigManager::create(&path).unwrap();
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -216,7 +223,8 @@ mod tests {
         file.flush().await.unwrap();
         file.sync_all().await.unwrap();
 
-        sleep(Duration::from_secs(1)).await; // 监控线程非 tokio 协程无法快进
+        sleep(Duration::from_secs(2)).await; // 监控线程非 tokio 协程无法快进
+        // 平台相关：不同性能的平台收到事件的事件不一样，可能会有延迟
 
         let port = manager.async_get(ConfigItem::ProtocolPort).await;
         assert_eq!(port, "8081");
@@ -226,10 +234,9 @@ mod tests {
     #[tokio::test]
     async fn set_config() {
         let (dir, path) = create_temp_config("protocol_port = \"8080\"");
-        let manager = ConfigManager::try_open(&path).unwrap();
-
+        let manager = ConfigManager::create(&path).unwrap();
         manager
-            .async_set(ConfigItem::ProtocolPort, "8081".to_string())
+            .async_set(ConfigItem::ProtocolPort, "8081".into())
             .await
             .unwrap();
         sleep(Duration::from_secs(2)).await; // 监控线程非 tokio 协程无法快进
@@ -242,32 +249,30 @@ mod tests {
     #[tokio::test]
     async fn handle_invalid_config() {
         let (dir, path) = create_temp_config("invalid_toml = [");
-        let manager = ConfigManager::try_open(&path).unwrap();
+        let manager = ConfigManager::create(&path).unwrap();
 
-        let _ = manager
-            .async_set(ConfigItem::ProtocolPort, "8082".to_string())
-            .await; // unsuccessful
-
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
-        println!("{}", content);
-        assert!(content.contains("invalid_toml = ["));
-
+        manager
+            .async_set(ConfigItem::ProtocolPort, "8082".into())
+            .await
+            .unwrap();
+        sleep(Duration::from_secs(2)).await;
         let port = manager.async_get(ConfigItem::ProtocolPort).await;
-        assert_eq!(&port, "5555"); // default value
+        assert_eq!(&port, "8082");
         dir.close().unwrap();
     }
 
     #[tokio::test]
     async fn preserve_other_settings() {
         let (dir, path) = create_temp_config("protocol_port = \"8080\"\nlog_level = \"debug\"\n");
-        let manager = ConfigManager::try_open(&path).unwrap();
+        let manager = ConfigManager::create(&path).unwrap();
 
         manager
-            .async_set(ConfigItem::ProtocolPort, "8081".to_string())
+            .async_set(ConfigItem::ProtocolPort, "8081".into())
             .await
             .unwrap();
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
+        println!("{}", content);
         assert!(content.contains("protocol_port = \"8081\""));
         assert!(content.contains("log_level = \"debug\""));
         dir.close().unwrap();

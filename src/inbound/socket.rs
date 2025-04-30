@@ -28,9 +28,8 @@ async fn create_socket(addr: &EndPoint) -> Result<UdpSocket> {
 pub type MsgSink = SplitSink<UdpFramed<MsgCodec>, (Msg, SocketAddr)>;
 pub type MsgStream = SplitStream<UdpFramed<MsgCodec>>;
 pub type MsgSinkMap = HashMap<EndPoint, MsgSink>;
-pub type MsgStreamMux = SelectAll<MsgStream>;
 
-pub async fn split_group() -> Result<(MsgSinkMap, MsgStreamMux)> {
+pub async fn split_group() -> Result<(MsgSinkMap, SelectAll<MsgStream>)> {
     let results = try_join_all(NicView::default().map(async move |iface| -> Result<_> {
         let addr = EndPoint::new(iface, PROTOCOL_PORT);
         let sock = create_socket(&addr).await?;
