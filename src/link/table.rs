@@ -17,7 +17,7 @@ pub fn link_state_table() -> &'static LinkStateTable {
 }
 pub struct LinkStateTable {
     links: Arc<DashMap<HostId, Bond>>,
-    scheduler: LinkResumeScheduler,
+    _scheduler: LinkResumeScheduler,
     delay_task_sender: Sender<LinkResumeTask>,
 }
 
@@ -26,7 +26,7 @@ impl LinkStateTable {
         let (scheduler, delay_task_sender) = LinkResumeScheduler::run();
         LinkStateTable {
             links: Arc::new(DashMap::new()),
-            scheduler,
+            _scheduler: scheduler,
             delay_task_sender,
         }
     }
@@ -53,7 +53,7 @@ impl LinkStateTable {
             .iter()
             .filter(|link| link.is_healthy.load(Ordering::Relaxed))
             .fold(
-                (Vec::with_capacity(bond.links.len()), 0u64),
+                (Vec::with_capacity(bond.links.len()), 0usize),
                 |(mut candidates, total_weight), link| {
                     candidates.push(link);
                     (candidates, total_weight.saturating_add(link.weight()))
@@ -68,13 +68,13 @@ impl LinkStateTable {
             rng.random_range(0..total_weight)
         };
         // 使用二分查找优化权重选择 (O(log n))
-        let weight_distributes: Vec<u64> = candidates
+        let weight_distributes = candidates
             .iter()
-            .scan(0u64, |acc, link| {
+            .scan(0usize, |acc, link| {
                 *acc += link.weight();
                 Some(*acc)
             })
-            .collect();
+            .collect::<Vec<usize>>();
         let selected_index = weight_distributes
             .binary_search_by(|probe| probe.cmp(&selected))
             .unwrap_or_else(|i| i);

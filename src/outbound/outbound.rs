@@ -1,8 +1,8 @@
 use super::HostId;
 use super::Msg;
 use super::MsgSinkMap;
+use crate::link::Event;
 use crate::link::LinkStateTable;
-use crate::link::NetworkEvent;
 use bytes::Bytes;
 use futures::SinkExt;
 use std::sync::Arc;
@@ -23,8 +23,8 @@ impl Outbound {
     pub fn run(
         links: Arc<LinkStateTable>,
         mut sinks: MsgSinkMap,
-    ) -> (Self, mpsc::Sender<(HostId, NetworkEvent)>) {
-        let (tx, mut rx) = mpsc::channel(10240);
+    ) -> (Self, mpsc::Sender<(HostId, Event)>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
         let abort = tokio::spawn(async move {
             while let Some((host, event)) = rx.recv().await {
                 let Ok(link) = links.assign(&host) else {
@@ -32,8 +32,8 @@ impl Outbound {
                     continue;
                 };
                 let msg = match event {
-                    NetworkEvent::Auth(state) => Msg::Auth { host, state },
-                    NetworkEvent::Task(cipher) => Msg::Task { host, cipher: cipher.to_vec() },
+                    Event::Auth(state) => Msg::Auth { host, state },
+                    Event::Task(cipher) => Msg::Task { host, cipher: cipher.to_vec() },
                 };
                 let local = link.local();
                 let remote = *link.remote();

@@ -17,18 +17,19 @@ pub fn handshake() -> Result<()> {
     // -> e
     let len = initiator.write_message(&[], &mut first_msg)?;
     println!("发起者握手协议密文{:?}", first_msg);
+
     responder.read_message(&first_msg[..len], &mut read_buf)?;
     println!("接收者读消息明文：{:?}", read_buf);
-
     // <- e, ee, s, se
     let len = responder.write_message(&[], &mut second_msg)?;
     println!("回应消息密文{:?}", second_msg);
+
     initiator.read_message(&second_msg[..len], &mut read_buf)?;
     println!("回应消息明文{:?}", read_buf);
-
     // -> s, es
     let len = initiator.write_message(&[], &mut first_msg)?;
     println!("发起者握手协议密文{:?}", first_msg);
+
     responder.read_message(&first_msg[..len], &mut read_buf)?;
     println!("接收者读消息明文：{:?}", read_buf);
 

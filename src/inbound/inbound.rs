@@ -1,5 +1,5 @@
 use super::{Msg, MsgStream};
-use futures::{stream::SelectAll, StreamExt};
+use futures::{StreamExt, stream::SelectAll};
 use std::net::SocketAddr;
 use tokio::{sync::mpsc, task::AbortHandle};
 use tracing::{error, info};
@@ -9,7 +9,9 @@ pub struct Inbound {
 }
 
 impl Inbound {
-    pub async fn receiving(mut stream: SelectAll<MsgStream>) -> (Self, mpsc::UnboundedReceiver<(Msg, SocketAddr)>) {
+    pub async fn receiving(
+        mut stream: SelectAll<MsgStream>,
+    ) -> (Self, mpsc::UnboundedReceiver<(Msg, SocketAddr)>) {
         let (tx, rx) = mpsc::unbounded_channel(); //需要足够大的buffer
         let abort = tokio::spawn(async move {
             while let Ok(parcel) = stream.select_next_some().await {

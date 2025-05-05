@@ -2,7 +2,6 @@ use super::Msg;
 use anyhow::anyhow;
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::warn;
 
 const PROTOCOL_VERSION: u8 = 0;
 
@@ -11,7 +10,6 @@ pub struct MsgCodec;
 
 impl MsgCodec {
     const HDR_LEN: usize = size_of::<u16>() + size_of::<u8>();
-    const MSG_MAX_LEN: u16 = u16::MAX;
 }
 
 impl Encoder<Msg> for MsgCodec {
@@ -87,9 +85,9 @@ mod tests {
     #[test]
     fn test_encoder_success() {
         let mut codec = MsgCodec;
-        let msg = Msg::Task {
+        let msg = Msg::Transfer {
             host: Uid::random(),
-            cipher: b"114514".to_vec(),
+            payload: b"114514".to_vec(),
         };
         let mut buffer = BytesMut::new();
 
@@ -102,9 +100,9 @@ mod tests {
     #[test]
     fn test_decoder_complete_message() {
         let mut codec = MsgCodec;
-        let msg = Msg::Task {
+        let msg = Msg::Transfer {
             host: Uid::random(),
-            cipher: b"114514".to_vec(),
+            payload: b"114514".to_vec(),
         };
         let mut bytes = build_encoded_message(&msg, PROTOCOL_VERSION);
 
@@ -123,9 +121,9 @@ mod tests {
     #[test]
     fn test_decoder_invalid_protocol_version() {
         let mut codec = MsgCodec;
-        let msg = Msg::Task {
+        let msg = Msg::Transfer {
             host: Uid::random(),
-            cipher: b"114514".to_vec(),
+            payload: b"114514".to_vec(),
         };
         let mut bytes = build_encoded_message(&msg, PROTOCOL_VERSION + 1); // 错误协议版本
 
@@ -137,9 +135,9 @@ mod tests {
     #[test]
     fn test_decoder_partial_body() {
         let mut codec = MsgCodec;
-        let msg = Msg::Task {
+        let msg = Msg::Transfer {
             host: Uid::random(),
-            cipher: b"114514".to_vec(),
+            payload: b"114514".to_vec(),
         };
         let mut full_bytes = build_encoded_message(&msg, PROTOCOL_VERSION);
 
@@ -168,13 +166,13 @@ mod tests {
     #[test]
     fn test_multiple_messages_in_stream() {
         let mut codec = MsgCodec;
-        let msg1 = Msg::Task {
+        let msg1 = Msg::Transfer {
             host: Uid::random(),
-            cipher: b"114514".to_vec(),
+            payload: b"114514".to_vec(),
         };
-        let msg2 = Msg::Task {
+        let msg2 = Msg::Transfer {
             host: Uid::random(),
-            cipher: b"114514".to_vec(),
+            payload: b"114514".to_vec(),
         };
 
         // 构建包含两个消息的字节流

@@ -11,7 +11,8 @@ use std::{
 use thiserror::Error;
 use tracing::{error, info};
 
-pub type Metric = u64;
+pub type Metric = usize;
+pub type Weight = usize;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LinkError {
@@ -91,19 +92,23 @@ impl LinkState {
 
     #[cfg(target_os = "windows")]
     // 应当对不同系统有不一样的行为
-    pub fn weight(&self) -> u64 {
+    pub fn weight(&self) -> Weight {
         // Use inverse metric + 1 to avoid division by zero
         // Higher metric means lower weight
-        1_000_000 / (self.metric + 1)
+        9999 as Metric / self.metric
+    }
+    #[cfg(target_os = "macos")]
+    // 应当对不同系统有不一样的行为
+    // Higher metric means lower weight
+    pub fn weight(&self) -> Weight {
+        // Use inverse metric + 1 to avoid division by zero
+        u16::MAX as Metric / self.metric
     }
     #[cfg(target_os = "linux")]
-    // 应当对不同系统有不一样的行为
-    pub fn weight(&self) -> u64 {
+    pub fn weight(&self) -> Weight {
         // Use inverse metric + 1 to avoid division by zero
-        // Higher metric means lower weight
-        1_000_000 / (self.metric + 1)
+        u32::MAX as Metric / self.metric
     }
-
     // 分配链路后立刻调用
     pub fn update_usage(&self) {
         let now = SystemTime::now()

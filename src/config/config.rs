@@ -6,6 +6,7 @@ use notify_debouncer_mini::{
 };
 use std::{
     collections::HashMap,
+    fmt::Display,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -45,6 +46,7 @@ pub enum ConfigItem {
 }
 
 impl From<ConfigItem> for &'static str {
+    #[inline]
     fn from(item: ConfigItem) -> Self {
         match item {
             ConfigItem::ProtocolPort => "protocol_port",
@@ -52,14 +54,15 @@ impl From<ConfigItem> for &'static str {
     }
 }
 
-impl From<ConfigItem> for String {
-    fn from(item: ConfigItem) -> Self {
-        let s: &'static str = item.into();
-        s.to_string()
+impl Display for ConfigItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s: &'static str = (*self).into();
+        write!(f, "{}", s)
     }
 }
 
 impl ConfigItem {
+    #[inline]
     fn default(&self) -> &'static str {
         match self {
             ConfigItem::ProtocolPort => "5555",
@@ -77,7 +80,7 @@ impl ConfigManager {
 
     fn default_inner() -> Prefs {
         use ConfigItem::*;
-        HashMap::from_iter([(ProtocolPort.into(), ProtocolPort.default().to_string())])
+        HashMap::from_iter([(ProtocolPort.to_string(), ProtocolPort.default().to_string())])
     }
 
     pub fn create(path: &Path) -> Result<Self, ConfigManagerError> {
@@ -123,7 +126,7 @@ impl ConfigManager {
             |f| {
                 let content = std::fs::read_to_string(&self.abs_path)?;
                 let mut table: toml::value::Table = toml::from_str(&content).unwrap_or_default();
-                table.insert(item.into(), value);
+                table.insert(item.to_string(), value);
                 let new_content =
                     toml::to_string_pretty(&table).expect("Failed to serialize table");
                 f.write_all(new_content.as_bytes())?;

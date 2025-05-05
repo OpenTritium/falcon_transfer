@@ -1,6 +1,9 @@
 use crate::{hot_file::FileRange, utils::HostId};
 use bytes::Bytes;
-use std::{path::Path, usize};
+use std::{
+    path::{Path, PathBuf},
+    usize,
+};
 pub type FileHash = u64;
 
 // 传输事件，上下游均能收到，来源网络
@@ -36,10 +39,16 @@ pub type TaggedTaskEvent = (TaskTag, TaskEvent);
 
 pub struct FileInfo {
     file_hash: FileHash,
-    file_name: PathBuf, //文件名
+    file_name: String, //文件名
     size: usize,
 }
 
+// //     let comp = path.components().last()?;
+
+//     // 排除根目录（如 Unix 的 `/` 或 Windows 的 `C:\`）
+//     if matches!(comp, Component::RootDir | Component::Prefix(_)) {
+//         return None;
+//     }
 impl FileInfo {
     pub fn file_hash(&self) -> FileHash {
         self.file_hash

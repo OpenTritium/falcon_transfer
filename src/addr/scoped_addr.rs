@@ -44,11 +44,7 @@ impl ScopedAddr {
     }
 
     pub fn is_wan(&self) -> bool {
-        if let Wan(_) = self {
-            true
-        } else {
-            false
-        }
+        if let Wan(_) = self { true } else { false }
     }
 
     pub fn get_std(&self) -> &StdIpv6Addr {
@@ -56,7 +52,7 @@ impl ScopedAddr {
             Lan { addr, .. } | Wan(addr) => addr,
         }
     }
-    
+
     pub fn scope_id(&self) -> Option<ScopeId> {
         match self {
             Lan { scope, .. } => Some(*scope),

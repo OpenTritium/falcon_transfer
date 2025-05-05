@@ -1,4 +1,4 @@
-use super::{MsgCodec, Msg, NicView};
+use super::{Msg, MsgCodec, NicView};
 use crate::addr::{EndPoint, Port, StdIpv6Addr};
 use anyhow::Result;
 use futures::{
@@ -10,7 +10,7 @@ use std::{collections::HashMap, net::SocketAddr};
 use tokio::net::UdpSocket;
 use tokio_util::udp::UdpFramed;
 
-const PROTOCOL_PORT:Port = 5555;
+const PROTOCOL_PORT: Port = 5555;
 
 /// 为所有活跃的网络接口创建 socket
 /// 对于本地链路地址需要加入特定组播进行发现
@@ -27,7 +27,7 @@ async fn create_socket(addr: &EndPoint) -> Result<UdpSocket> {
 
 pub type MsgSink = SplitSink<UdpFramed<MsgCodec>, (Msg, SocketAddr)>;
 pub type MsgStream = SplitStream<UdpFramed<MsgCodec>>;
-pub type MsgSinkMap = HashMap<EndPoint, MsgSink>;
+pub type MsgSinkMap = HashMap<EndPoint, MsgSink>; // key 应当是 scoped addr
 
 pub async fn split_group() -> Result<(MsgSinkMap, SelectAll<MsgStream>)> {
     let results = try_join_all(NicView::default().map(async move |iface| -> Result<_> {
