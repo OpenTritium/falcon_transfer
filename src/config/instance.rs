@@ -1,3 +1,4 @@
+use camino::Utf8PathBuf;
 use directories::ProjectDirs;
 
 use super::{ConfigManager, ConfigManagerError};
@@ -12,6 +13,7 @@ pub fn config_manager() -> Result<&'static ConfigManager, ConfigManagerError> {
             std::fs::create_dir_all(cfg_dir)?;
         }
         let path = cfg_dir.join("config.toml");
+        let path = Utf8PathBuf::from_path_buf(path).unwrap();
         println!("Config file path: {:?}", path);
         ConfigManager::create(&path)
     })
